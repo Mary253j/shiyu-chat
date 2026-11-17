@@ -8,10 +8,12 @@ import { buildContextPlan, getBalance, streamChat } from '../core/deepseek';
 import { ATTACHMENT_LIMITS, classifyAttachment, type MessageAttachment, type FilePurpose } from '../core/attachments';
 import { uploadDeepSeekFile, retrieveDeepSeekFile } from '../core/deepseek-files';
 import { createStreamBuffer } from '../core/streamBuffer';
-import { exportHistory, mergeConversations, parseHistory, ImportPreview } from '../core/history';
-import { checkHistoryInputSize, HISTORY_FILE_LIMIT_LABEL } from '../core/history-limits';
+import { exportHistory, mergeConversations, parseHistoryFromReader, ImportPreview } from '../core/history';
+import { checkHistoryInputSize } from '../core/history-limits';
+import { assertHistoryBackupable } from '../core/history-backup-check';
 import { deleteConversationMessages } from '../core/message-deletion';
 import { deleteAllLocalData, loadApiKey, loadState, saveApiKey, saveState } from './storage';
+import { openHistoryFile, type OpenHistoryFile } from './history-file';
 
 function useLatestCallback<Args extends unknown[], Result>(callback: (...args: Args) => Result) {
   const latest = useRef(callback);
@@ -20,6 +22,13 @@ function useLatestCallback<Args extends unknown[], Result>(callback: (...args: A
 }
 
 const yieldToUi = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+function importFailureMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : '';
+  if (/OutOfMemory|out of memory|failed to allocate|allocation failed|Array buffer allocation|Invalid string length/i.test(message)) {
+    return '导入未完成：手机可用内存不足，已有记录未修改。请关闭其他应用后重试，或将较大的对话分批导出后再导入。';
+  }
+  return message || '导入失败，已有记录未修改。请重新选择文件后重试。';
+}
 interface DraftAttachment {
   id: string;
   name: string;
@@ -55,6 +64,8 @@ function useAppController() {
   const [saveError, setSaveError] = useState('');
   const [balance, setBalance] = useState<Awaited<ReturnType<typeof getBalance>> | null>(null);
   const [preview, setPreview] = useState<ImportPreview | null>(null);
+  const [importProgress, setImportProgress] = useState('');
+  const [importError, setImportError] = useState('');
   const activeRequest = useRef<AbortController | null>(null);
   const accountTask = useRef(false);
   const initializing = useRef(false);
@@ -442,38 +453,62 @@ function useAppController() {
   }
 
   async function pickHistory() {
-    if (working || activeRequest.current) return;
-    setWorking(true); setNotice('');
+    if (working || activeRequest.current || accountTask.current) return;
+    accountTask.current = true;
+    setWorking(true); setNotice(''); setImportError('');
     let cached: File | undefined;
+    let reader: OpenHistoryFile | undefined;
     try {
       const result = await DocumentPicker.getDocumentAsync({ type: ['application/json', 'application/zip', 'application/x-zip-compressed', 'application/octet-stream', 'text/plain'], copyToCacheDirectory: true });
       if (result.canceled) return;
       const asset = result.assets[0];
+      if (Platform.OS !== 'web') cached = new File(asset.uri);
       if (asset.size !== undefined) checkHistoryInputSize(asset.size);
-      let bytes: Uint8Array;
-      if (Platform.OS === 'web' && asset.file) bytes = new Uint8Array(await asset.file.arrayBuffer());
-      else { cached = new File(asset.uri); bytes = await cached.bytes(); }
-      setPreview(parseHistory(bytes, asset.name));
-    } catch (error) { setNotice(error instanceof Error ? error.message : '导入失败，原记录未改动。'); }
+      setImportProgress('正在读取导入文件…');
+      await yieldToUi();
+      reader = openHistoryFile(asset);
+      setPreview(await parseHistoryFromReader(reader, asset.name, {
+        yieldControl: yieldToUi,
+        onProgress: progress => {
+          const label = progress.phase === 'parsing' ? '正在整理对话' : progress.phase === 'checking' ? '正在校验文件' : '正在读取文件';
+          const percent = progress.total > 0 ? Math.min(100, Math.floor(progress.completed / progress.total * 100)) : 0;
+          setImportProgress(`${label}… ${percent}%`);
+        },
+      }));
+    } catch (error) { setNotice(importFailureMessage(error)); }
     finally {
+      await reader?.close();
       // The picker owns this cache copy, not the user's original file.
       if (cached?.uri.startsWith(Paths.cache.uri)) { try { await cached.delete(); } catch { /* cache cleanup can retry at OS level */ } }
-      setWorking(false);
+      accountTask.current = false; setWorking(false); setImportProgress('');
     }
   }
-  function confirmImport() {
-    if (!preview || activeRequest.current) return;
-    const merged = mergeConversations(current.current.conversations, preview.conversations);
+  async function confirmImport() {
+    if (!preview || working || activeRequest.current || accountTask.current) return;
+    accountTask.current = true;
+    setWorking(true); setImportError('');
+    let accepted = false;
     try {
-      // Do not accept an import which cannot subsequently be exported and restored.
-      exportHistory({ ...current.current, conversations: merged.conversations });
-    } catch {
-      setPreview(null);
-      setNotice(`合并后的记录未通过备份检查（容量上限 ${HISTORY_FILE_LIMIT_LABEL}），尚未导入。请先备份并分批整理对话。`);
-      return;
-    }
-    update(s => ({ ...s, conversations: merged.conversations, activeConversationId: s.activeConversationId ?? merged.conversations[0]?.id ?? null }));
-    setPreview(null); setNotice(`已导入 ${merged.added} 个对话，保留已有记录，跳过 ${merged.skipped} 个重复对话。`);
+      setImportProgress('正在检查合并后的记录…');
+      await yieldToUi();
+      const merged = mergeConversations(current.current.conversations, preview.conversations);
+      // Validate one conversation at a time; never serialize and reparse the
+      // entire existing library alongside the newly imported preview.
+      await assertHistoryBackupable({ ...current.current, conversations: merged.conversations }, {
+        yieldControl: yieldToUi,
+        onProgress: ({ completed, total }) => setImportProgress(`正在检查记录… ${completed}/${total}`),
+      });
+      update(s => ({ ...s, conversations: merged.conversations, activeConversationId: s.activeConversationId ?? merged.conversations[0]?.id ?? null }));
+      accepted = true;
+      setPreview(null); setImportProgress('正在保存导入的对话…');
+      await yieldToUi();
+      await saveState(current.current);
+      setSaveError('');
+      setNotice(`已导入 ${merged.added} 个对话，保留已有记录，跳过 ${merged.skipped} 个重复对话。`);
+    } catch (error) {
+      if (accepted) setSaveError('导入的记录尚未确认保存成功，请保留当前页面并点击重试保存。');
+      else setImportError(importFailureMessage(error));
+    } finally { accountTask.current = false; setWorking(false); setImportProgress(''); }
   }
   async function backup() {
     if (working || activeRequest.current) return;
@@ -522,7 +557,7 @@ function useAppController() {
     draftText: textDrafts[state.activeConversationId ?? 'new'] ?? '', setDraftText: useLatestCallback(setDraftText),
     pickAttachments: useLatestCallback(pickAttachments),
     removeDraftAttachment: useLatestCallback(removeDraftAttachment),
-    saveError, retrySave: useCallback(() => setSaveRevision(v => v + 1), []), balance, preview, setPreview,
+    saveError, retrySave: useCallback(() => setSaveRevision(v => v + 1), []), balance, preview, setPreview, importProgress, importError,
     initialize: useLatestCallback(initialize),
     newConversation: useLatestCallback(newConversation),
     selectConversation: useLatestCallback(selectConversation),

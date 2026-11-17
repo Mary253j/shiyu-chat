@@ -2,6 +2,8 @@ import { Inflate, strFromU8, strToU8 } from 'fflate';
 import type { AppState, ContextUsage, Conversation, Message, MessageStatus } from './types';
 import { parseMessageAttachments } from './attachments';
 import { checkHistoryInputSize, HISTORY_FILE_LIMIT_BYTES, HISTORY_FILE_LIMIT_LABEL } from './history-limits';
+import { isHistoryMemoryError, openHistoryZip, readHistoryRange, readHistoryText, type HistoryReader, type HistoryReadOptions } from './history-reader';
+export type { HistoryReader, HistoryReadOptions, HistoryReadProgress } from './history-reader';
 
 /**
  * Independent reader of DeepSeek's documented v3 archive format.
@@ -76,7 +78,10 @@ function warn(warnings: Set<string>, value: string): void { warnings.add(value);
 function parseJson(value: string, label: string): unknown {
   let parsed: unknown;
   try { parsed = JSON.parse(value.replace(/^\uFEFF/, '')); }
-  catch { return fail(`${label}的 JSON 已损坏。`); }
+  catch (error) {
+    if (isHistoryMemoryError(error)) throw error;
+    return fail(`${label}的 JSON 已损坏。`);
+  }
   function* children(value: object): Generator<unknown> {
     if (Array.isArray(value)) { yield* value; return; }
     // Do not allocate Object.values + one pending object per property: a flat
@@ -125,7 +130,9 @@ function safeZipPath(value: string): string {
   return normalized;
 }
 function decodeUtf8(value: Uint8Array, label: string): string {
-  const decoded = strFromU8(value);
+  let start = 0;
+  while (value[start] === 0xef && value[start + 1] === 0xbb && value[start + 2] === 0xbf) start += 3;
+  const decoded = '\uFEFF'.repeat(start / 3) + strFromU8(value.subarray(start));
   // Round-trip rejects malformed UTF-8 without relying on TextDecoder in RN.
   const encoded = strToU8(decoded);
   if (encoded.length !== value.length || encoded.some((byte, i) => byte !== value[i])) fail(`${label}不是有效 UTF-8。`);
@@ -500,28 +507,18 @@ function parseOfficialZip(bytes: Uint8Array, budget: Budget): Conversation[] {
   return conversations;
 }
 
-/** Parses into a preview only: never mutates existing conversations. */
-export function parseHistory(input: string | Uint8Array, filename: string): ImportPreview {
-  if (typeof input !== 'string' && !(input instanceof Uint8Array)) fail('文件内容类型不受支持。');
-  if (typeof input === 'string') checkHistoryInputSize(input.length);
-  const bytes = typeof input === 'string' ? strToU8(input) : input;
-  checkHistoryInputSize(bytes.length);
-  if (!bytes.length) fail('文件为空。');
-  const budget: Budget = { messages: 0 }; let conversations: Conversation[]; let sourceLabel: string;
-  const zip = bytes[0] === 0x50 && bytes[1] === 0x4b;
-  if (zip || /\.zip$/i.test(filename)) {
-    conversations = parseOfficialZip(bytes, budget); sourceLabel = 'DeepSeek 官方 ZIP v3';
-  } else {
-    const parsed = parseJson(typeof input === 'string' ? input : decodeUtf8(bytes, filename), filename || '导入文件');
-    const object = Array.isArray(parsed) ? undefined : row(parsed, '导入文件');
-    const native = object?.schemaVersion !== undefined;
-    if (native && object.schemaVersion !== 1) fail('不支持该应用备份版本。');
-    if (object?.export_format_version !== undefined && object.export_format_version !== 3) fail('不支持该 DeepSeek 导出版本。');
-    const values = Array.isArray(parsed) ? parsed : list(object?.conversations ?? object?.chat_sessions ?? (object?.messages || object?.mapping ? [object] : undefined), '会话列表');
-    if (values.length > HISTORY_LIMITS.conversations) fail('会话数量超过限制。');
-    conversations = values.map((value) => native ? backupConversation(value, budget) : importedConversation(value, false, budget));
-    sourceLabel = native ? '拾语备份 v1' : 'DeepSeek 旧版 JSON';
-  }
+function parseJsonConversations(parsed: unknown, budget: Budget): { conversations: Conversation[]; sourceLabel: string } {
+  const object = Array.isArray(parsed) ? undefined : row(parsed, '导入文件');
+  const native = object?.schemaVersion !== undefined;
+  if (native && object.schemaVersion !== 1) fail('不支持该应用备份版本。');
+  if (object?.export_format_version !== undefined && object.export_format_version !== 3) fail('不支持该 DeepSeek 导出版本。');
+  const values = Array.isArray(parsed) ? parsed : list(object?.conversations ?? object?.chat_sessions ?? (object?.messages || object?.mapping ? [object] : undefined), '会话列表');
+  if (values.length > HISTORY_LIMITS.conversations) fail('会话数量超过限制。');
+  return { conversations: values.map((value) => native ? backupConversation(value, budget) : importedConversation(value, false, budget)),
+    sourceLabel: native ? '拾语备份 v1' : 'DeepSeek 旧版 JSON' };
+}
+
+function importPreview(conversations: Conversation[], sourceLabel: string): ImportPreview {
   const seen = new Set<string>(); const localIds = new Set<string>(); const warnings = new Set<string>();
   for (const conversation of conversations) {
     const key = conversation.sourceId ?? `local:${conversation.id}`;
@@ -533,6 +530,95 @@ export function parseHistory(input: string | Uint8Array, filename: string): Impo
     }
   }
   return { conversations, warnings: [...warnings], messageCount: conversations.reduce((sum, item) => sum + item.messages.length, 0), sourceLabel };
+}
+
+/** Count UTF-8 bytes without allocating a duplicate byte buffer for a JSON string. */
+function utf8Bytes(value: string): number {
+  let length = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) length++;
+    else if (code < 0x800) length += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length
+      && value.charCodeAt(index + 1) >= 0xdc00 && value.charCodeAt(index + 1) <= 0xdfff) { length += 4; index++; }
+    else length += 3;
+  }
+  return length;
+}
+
+/** Parses into a preview only: never mutates existing conversations. */
+export function parseHistory(input: string | Uint8Array, filename: string): ImportPreview {
+  if (typeof input !== 'string' && !(input instanceof Uint8Array)) fail('文件内容类型不受支持。');
+  checkHistoryInputSize(typeof input === 'string' ? utf8Bytes(input) : input.length);
+  if (!input.length) fail('文件为空。');
+  const budget: Budget = { messages: 0 };
+  const zip = typeof input === 'string' ? input.startsWith('PK') : input[0] === 0x50 && input[1] === 0x4b;
+  if (zip || /\.zip$/i.test(filename)) return importPreview(parseOfficialZip(typeof input === 'string' ? strToU8(input) : input, budget), 'DeepSeek 官方 ZIP v3');
+  const parsed = parseJson(typeof input === 'string' ? input : decodeUtf8(input, filename), filename || '导入文件');
+  const { conversations, sourceLabel } = parseJsonConversations(parsed, budget);
+  return importPreview(conversations, sourceLabel);
+}
+
+/**
+ * Bounded file reads are essential on Android: File.bytes() creates a complete
+ * native byte array before JavaScript can start parsing. This path never loads
+ * the complete ZIP, all expanded entries, or an attachment into one buffer.
+ */
+export async function parseHistoryFromReader(reader: HistoryReader, filename: string, options: HistoryReadOptions = {}): Promise<ImportPreview> {
+  checkHistoryInputSize(reader.size);
+  if (!reader.size) fail('文件为空。');
+  options.onProgress?.({ phase: 'reading', completed: 0, total: reader.size });
+  await options.yieldControl?.();
+  const prefix = await readHistoryRange(reader, 0, Math.min(2, reader.size));
+  const budget: Budget = { messages: 0 };
+  if (!(prefix[0] === 0x50 && prefix[1] === 0x4b) && !/\.zip$/i.test(filename)) {
+    // Legacy JSON is decoded in chunks but still parsed as one JSON document.
+    // Do not round-trip it through UTF-8 or an intermediate whole-file byte array.
+    const parsed = parseJson(await readHistoryText(reader, filename || '导入文件', options), filename || '导入文件');
+    const { conversations, sourceLabel } = parseJsonConversations(parsed, budget);
+    return importPreview(conversations, sourceLabel);
+  }
+  const zip = await openHistoryZip(reader, HISTORY_LIMITS, options);
+  const files = new Map(zip.entries.map(entry => [entry.name, entry]));
+  const json = async (name: string): Promise<unknown> => {
+    const entry = files.get(name);
+    if (!entry) fail(`ZIP 缺少 ${name}。`);
+    return parseJson(await zip.readText(entry), name);
+  };
+  const manifest = row(await json('manifest.json'), 'manifest');
+  if (manifest.export_format_version !== 3) fail('仅支持 DeepSeek ZIP 导出格式 v3，请重新导出聊天记录。');
+  const index = list(await json('chat_session_index.json'), '会话索引');
+  if (index.length > HISTORY_LIMITS.conversations) fail('会话数量超过限制。');
+  const ids = new Set<string>(); const items: { id: string; count: number }[] = [];
+  for (const value of index) {
+    const item = row(value, '会话索引'); const id = idValue(item.id, '索引 ID');
+    if (/[/\\]/.test(id) || id === '.' || id === '..' || ids.has(id)) fail('会话索引 ID 重复或无效。');
+    if (!Number.isSafeInteger(item.message_count) || Number(item.message_count) < 0) fail('索引消息数量与会话文件不一致。');
+    ids.add(id); items.push({ id, count: item.message_count as number });
+  }
+  for (const name of files.keys()) {
+    if (['manifest.json', 'chat_session_index.json', 'user.json'].includes(name)) continue;
+    const session = /^chat_sessions\/([^/]+)\.json$/.exec(name);
+    if (session && ids.has(session[1])) continue;
+    const attachment = /^chat_sessions\/([^/]+)_files\//.exec(name);
+    if (attachment && ids.has(attachment[1])) continue;
+    fail(`ZIP 中存在未被索引记录的文件：${name}`);
+  }
+  const conversations: Conversation[] = [];
+  for (const item of items) {
+    options.onProgress?.({ phase: 'parsing', completed: conversations.length, total: items.length });
+    await options.yieldControl?.();
+    const data = row(await json(`chat_sessions/${item.id}.json`), '会话');
+    if (data.id !== item.id) fail('索引与会话文件 ID 不一致。');
+    if (item.count !== list(data.messages, '会话消息').length) fail('索引消息数量与会话文件不一致。');
+    conversations.push(importedConversation(data, true, budget));
+  }
+  // CRC-check every remaining entry, including attachments, without retaining
+  // its output. No preview is returned until the complete archive is verified.
+  for (const entry of zip.entries) await zip.verify(entry);
+  options.onProgress?.({ phase: 'parsing', completed: conversations.length, total: items.length });
+  await options.yieldControl?.();
+  return importPreview(conversations, 'DeepSeek 官方 ZIP v3');
 }
 
 /** Retains the existing conversation on source-ID or local-ID conflicts. */
