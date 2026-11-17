@@ -150,6 +150,10 @@ function historyUnits(messages: Message[]): HistoryUnit[] {
   let pendingUser: Message | undefined;
   for (let index = 0; index < messages.length - 1; index++) {
     const message = messages[index];
+    if (message.contextBoundaryBefore === true) {
+      if (pendingUser && usableUser(pendingUser)) units.push(unit([prepareUser(pendingUser)]));
+      pendingUser = undefined;
+    }
     if (message.role === 'user') {
       // A prior unanswered user message is still a real user-provided fact.
       if (pendingUser && usableUser(pendingUser)) units.push(unit([prepareUser(pendingUser)]));

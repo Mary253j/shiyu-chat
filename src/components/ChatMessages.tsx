@@ -1,4 +1,4 @@
-import React, { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator, Platform, Pressable, StyleSheet, Text, View, VirtualizedList,
   type ListRenderItemInfo, type NativeScrollEvent, type NativeSyntheticEvent,
@@ -18,12 +18,14 @@ const LATEST_THRESHOLD = 72;
 interface Props {
   messages: Message[];
   busy: boolean;
+  actionsDisabled: boolean;
   wide: boolean;
   /** Changed only by an explicit send/retry action, not by arriving tokens. */
   followRequest: number;
   onCopy: (content: string) => void;
   onLink: (url: string) => void;
   onRetry: (userContent: string) => void;
+  onDeleteMessages: (ids: string[], onDeleted?: () => void) => void;
 }
 
 /**
@@ -31,7 +33,7 @@ interface Props {
  * content immediately, without measuring or mounting an entire imported history.
  * getItem reverses indexing without allocating a reversed array on every token.
  */
-const ChatMessages = memo(function ChatMessages({ messages, busy, wide, followRequest, onCopy, onLink, onRetry }: Props) {
+const ChatMessages = memo(function ChatMessages({ messages, busy, actionsDisabled, wide, followRequest, onCopy, onLink, onRetry, onDeleteMessages }: Props) {
   const list = useRef<InstanceType<typeof VirtualizedList>>(null);
   const following = useRef(true);
   const dragging = useRef(false);
@@ -41,10 +43,29 @@ const ChatMessages = memo(function ChatMessages({ messages, busy, wide, followRe
   const frame = useRef<number | null>(null);
   const jumpVisible = useRef(false);
   const [showLatest, setShowLatest] = useState(false);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const latest = messages[messages.length - 1];
   const previous = messages[messages.length - 2];
-  const retryText = !busy && latest?.role === 'assistant' && ['error', 'stopped'].includes(latest.status)
+  const retryText = !busy && !actionsDisabled && latest?.role === 'assistant' && !latest.contextBoundaryBefore && ['error', 'stopped'].includes(latest.status)
     && previous?.role === 'user' ? previous.content : undefined;
+  const clearSelection = useCallback(() => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
+  const toggleSelection = useCallback((id: string) => {
+    if (actionsDisabled) return;
+    setSelectedIds(before => {
+      const next = new Set(before);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, [actionsDisabled]);
+  const deleteSingle = useCallback((id: string) => {
+    if (!actionsDisabled) onDeleteMessages([id]);
+  }, [actionsDisabled, onDeleteMessages]);
+  const allSelected = selectedIds.size === messages.length;
+  const listState = useMemo(() => ({ selectionMode, selectedIds, retryText, actionsDisabled }), [selectionMode, selectedIds, retryText, actionsDisabled]);
 
   const showJump = useCallback((visible: boolean) => {
     if (jumpVisible.current === visible) return;
@@ -103,10 +124,27 @@ const ChatMessages = memo(function ChatMessages({ messages, busy, wide, followRe
 
   const renderItem = useCallback(({ item, index }: ListRenderItemInfo<Message>) => (
     <MessageBubble message={item} onCopy={onCopy} onLink={onLink} onRetry={onRetry}
-      retryText={index === 0 ? retryText : undefined} />
-  ), [onCopy, onLink, onRetry, retryText]);
+      retryText={index === 0 ? retryText : undefined} actionsDisabled={actionsDisabled}
+      selectionMode={selectionMode} selected={selectedIds.has(item.id)} onToggleSelection={toggleSelection} onDelete={deleteSingle} />
+  ), [onCopy, onLink, onRetry, retryText, actionsDisabled, selectionMode, selectedIds, toggleSelection, deleteSingle]);
 
   return <View style={styles.container}>
+    <View testID="message-selection-toolbar" style={[styles.selectionToolbar, wide ? styles.widePadding : styles.phonePadding]}>
+      {selectionMode ? <>
+        <Text style={styles.selectionCount}>已选 {selectedIds.size} 条</Text>
+        <Pressable accessibilityRole="button" accessibilityLabel={allSelected ? '取消全选' : '全选消息'} disabled={actionsDisabled}
+          onPress={() => setSelectedIds(allSelected ? new Set() : new Set(messages.map(message => message.id)))}
+          style={[styles.toolbarButton, actionsDisabled && styles.disabled]}><Text style={styles.toolbarLabel}>{allSelected ? '取消全选' : '全选'}</Text></Pressable>
+        <Pressable accessibilityRole="button" accessibilityLabel="取消选择" disabled={actionsDisabled} onPress={clearSelection}
+          style={[styles.toolbarButton, actionsDisabled && styles.disabled]}><Text style={styles.toolbarLabel}>取消</Text></Pressable>
+        <Pressable accessibilityRole="button" accessibilityLabel="删除选中消息" disabled={actionsDisabled || !selectedIds.size}
+          onPress={() => onDeleteMessages([...selectedIds], clearSelection)}
+          style={[styles.toolbarButton, styles.deleteSelected, (actionsDisabled || !selectedIds.size) && styles.disabled]}>
+          <Feather name="trash-2" size={14} color="#A45A44" /><Text style={styles.deleteLabel}>删除选中</Text>
+        </Pressable>
+      </> : <Pressable accessibilityRole="button" accessibilityLabel="选择消息" disabled={actionsDisabled} onPress={() => setSelectionMode(true)}
+        style={[styles.toolbarButton, actionsDisabled && styles.disabled]}><Feather name="check-square" size={15} color={colors.green} /><Text style={styles.toolbarLabel}>选择消息</Text></Pressable>}
+    </View>
     <VirtualizedList
       ref={list}
       testID="chat-messages"
@@ -115,7 +153,7 @@ const ChatMessages = memo(function ChatMessages({ messages, busy, wide, followRe
       getItemCount={getItemCount}
       keyExtractor={keyExtractor}
       renderItem={renderItem}
-      extraData={retryText}
+      extraData={listState}
       inverted
       style={styles.container}
       contentContainerStyle={[styles.messages, wide ? styles.widePadding : styles.phonePadding]}
@@ -154,12 +192,16 @@ const MarkdownContent = memo(function MarkdownContent({ content, onLink }: { con
   return <Markdown style={markdownStyles} onLinkPress={onLinkPress} rules={markdownRules}>{content}</Markdown>;
 });
 
-const MessageBubble = memo(function MessageBubble({ message, onCopy, onLink, onRetry, retryText }: {
+const MessageBubble = memo(function MessageBubble({ message, onCopy, onLink, onRetry, retryText, actionsDisabled, selectionMode, selected, onToggleSelection, onDelete }: {
   message: Message; onCopy: Props['onCopy']; onLink: Props['onLink']; onRetry: Props['onRetry']; retryText?: string;
+  actionsDisabled: boolean; selectionMode: boolean; selected: boolean;
+  onToggleSelection: (id: string) => void; onDelete: (id: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const isUser = message.role === 'user';
   return <View testID={`chat-message-${message.id}`} style={[styles.messageRow, isUser && styles.userRow]}>
+    <View style={[styles.messageBody, isUser && styles.userRow]} pointerEvents={selectionMode ? 'none' : 'auto'}
+      accessibilityElementsHidden={selectionMode} importantForAccessibility={selectionMode ? 'no-hide-descendants' : 'auto'}>
     {!isUser && <View style={styles.assistantLabel}><View style={styles.smallMark}><Feather name="feather" size={14} color="#fff" /></View><Text style={styles.small}>DeepSeek</Text><Text style={styles.tiny}>· AI 生成</Text></View>}
     <View style={[styles.bubble, isUser && styles.userBubble]}>
       {!!message.attachments?.length && <View style={styles.attachments}>
@@ -189,10 +231,20 @@ const MessageBubble = memo(function MessageBubble({ message, onCopy, onLink, onR
         {message.contextUsage.truncated && message.contextUsage.omittedHistoryMessages === 0 && <Text style={styles.contextWarning}>本次上下文达到携带上限，原记录仍保存在本机。</Text>}
       </View>}
     </View>
-    {!isUser && message.status !== 'streaming' && <View style={styles.messageActions}>
-      {!!message.content && <Pressable accessibilityRole="button" accessibilityLabel="复制回复" onPress={() => onCopy(message.content)} style={styles.iconButton}><Feather name="copy" size={18} color={colors.green} /></Pressable>}
-      {retryText !== undefined && <Pressable accessibilityRole="button" accessibilityLabel="重新生成（将消耗 API）" onPress={() => onRetry(retryText)} style={styles.retry}><Feather name="rotate-cw" size={14} color={colors.green} /><Text style={styles.tiny}>重新生成（将消耗 API）</Text></Pressable>}
-    </View>}
+    <View style={[styles.messageActions, selectionMode && styles.invisible]}>
+      {!isUser && message.status !== 'streaming' && !!message.content && <Pressable accessibilityRole="button" accessibilityLabel="复制回复" onPress={() => onCopy(message.content)} style={styles.iconButton}><Feather name="copy" size={18} color={colors.green} /></Pressable>}
+      {retryText !== undefined && <Pressable accessibilityRole="button" accessibilityLabel="重新生成（将消耗 API）" disabled={actionsDisabled} onPress={() => onRetry(retryText)} style={styles.retry}><Feather name="rotate-cw" size={14} color={colors.green} /><Text style={styles.tiny}>重新生成（将消耗 API）</Text></Pressable>}
+      <Pressable accessibilityRole="button" accessibilityLabel="删除此消息" disabled={actionsDisabled} onPress={() => onDelete(message.id)} style={[styles.deleteMessage, actionsDisabled && styles.disabled]}>
+        <Feather name="trash-2" size={14} color={colors.muted} /><Text style={styles.tiny}>删除</Text>
+      </Pressable>
+    </View>
+    </View>
+    {selectionMode && <Pressable testID={`select-message-${message.id}`} accessibilityRole="checkbox" accessibilityLabel="选择此消息"
+      accessibilityHint={`${isUser ? '我的消息' : 'DeepSeek 回复'}：${message.content.slice(0, 80) || '附件消息'}`}
+      aria-checked={selected} aria-disabled={actionsDisabled} disabled={actionsDisabled} onPress={() => onToggleSelection(message.id)}
+      style={[styles.selectionOverlay, selected && styles.selectedOverlay]}>
+      <View style={styles.checkboxMark}><Feather name={selected ? 'check-circle' : 'circle'} size={22} color={colors.green} /></View>
+    </Pressable>}
   </View>;
 });
 
@@ -206,11 +258,14 @@ function formatAttachmentSize(bytes: number): string {
 const markdownStyles = StyleSheet.create({ body: { fontSize: 16, color: colors.ink, lineHeight: 27 }, paragraph: { marginTop: 0, marginBottom: 10 }, code_inline: { backgroundColor: '#EDF0EB', color: colors.ink }, fence: { backgroundColor: '#EFF2EC', borderColor: colors.line, color: colors.ink, borderRadius: 8, padding: 12 }, link: { color: colors.green }, heading1: { fontSize: 23, lineHeight: 32 }, heading2: { fontSize: 20, lineHeight: 29 }, table: { borderColor: colors.line }, tr: { borderColor: colors.line } });
 const styles = StyleSheet.create({
   container: { flex: 1, minHeight: 0 },
+  selectionToolbar: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'flex-end', gap: 4, paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: colors.line, width: '100%', maxWidth: 920, alignSelf: 'center' },
+  toolbarButton: { minHeight: 36, paddingHorizontal: 9, paddingVertical: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, borderRadius: 8 }, toolbarLabel: { fontSize: 12, color: colors.green }, selectionCount: { marginRight: 'auto', fontSize: 12, color: colors.ink, fontWeight: '600' }, deleteSelected: { backgroundColor: '#F8ECE6' }, deleteLabel: { fontSize: 12, color: '#A45A44' }, disabled: { opacity: 0.4 }, invisible: { opacity: 0 },
   messages: { paddingVertical: 20, maxWidth: 920, alignSelf: 'center', width: '100%' },
   widePadding: { paddingHorizontal: 36 }, phonePadding: { paddingHorizontal: 18 },
   latestButton: { position: 'absolute', bottom: 12, alignSelf: 'center', flexDirection: 'row', gap: 6, alignItems: 'center', backgroundColor: '#FFFFFF', borderColor: colors.line, borderWidth: 1, borderRadius: 20, paddingHorizontal: 16, paddingVertical: 11, elevation: 3, boxShadow: '0 2px 10px rgba(38,65,45,0.1)' },
   latestLabel: { fontSize: 12, color: colors.green, fontWeight: '600' },
-  messageRow: { marginBottom: 25, alignItems: 'flex-start' }, userRow: { alignItems: 'flex-end' },
+  messageRow: { marginBottom: 25, alignItems: 'flex-start' }, messageBody: { width: '100%', alignItems: 'flex-start' }, userRow: { alignItems: 'flex-end' },
+  selectionOverlay: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, borderRadius: 12, borderWidth: 1, borderColor: colors.line }, selectedOverlay: { borderColor: '#8CAB8F', backgroundColor: 'rgba(100, 145, 105, 0.06)' }, checkboxMark: { position: 'absolute', right: 10, bottom: 9, backgroundColor: '#FAF9F6', borderRadius: 12 }, deleteMessage: { minHeight: 40, paddingHorizontal: 10, paddingVertical: 10, flexDirection: 'row', gap: 5, alignItems: 'center', justifyContent: 'center' },
   assistantLabel: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }, smallMark: { width: 26, height: 26, borderRadius: 9, backgroundColor: colors.green, justifyContent: 'center', alignItems: 'center' },
   bubble: { maxWidth: '100%', width: '100%' }, userBubble: { backgroundColor: '#EAF0E6', width: 'auto', maxWidth: '88%', borderRadius: 18, borderTopRightRadius: 5, paddingVertical: 12, paddingHorizontal: 17 }, messageText: { fontSize: 16, lineHeight: 27, color: colors.ink },
   reasoning: { backgroundColor: '#F0F2EC', borderRadius: 10, padding: 10, marginBottom: 12 }, reasoningToggle: { flexDirection: 'row', gap: 9, alignItems: 'center' }, reasoningText: { color: '#738076', fontSize: 13, lineHeight: 23, marginTop: 10 },

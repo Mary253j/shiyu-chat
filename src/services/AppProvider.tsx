@@ -10,6 +10,7 @@ import { uploadDeepSeekFile, retrieveDeepSeekFile } from '../core/deepseek-files
 import { createStreamBuffer } from '../core/streamBuffer';
 import { exportHistory, mergeConversations, parseHistory, ImportPreview } from '../core/history';
 import { checkHistoryInputSize, HISTORY_FILE_LIMIT_LABEL } from '../core/history-limits';
+import { deleteConversationMessages } from '../core/message-deletion';
 import { deleteAllLocalData, loadApiKey, loadState, saveApiKey, saveState } from './storage';
 
 function useLatestCallback<Args extends unknown[], Result>(callback: (...args: Args) => Result) {
@@ -146,7 +147,7 @@ function useAppController() {
   const active = state.conversations.find(c => c.id === state.activeConversationId) ?? null;
 
   function newConversation() {
-    if (activeRequest.current) return;
+    if (activeRequest.current || accountTask.current) return;
     const id = createId();
     const now = Date.now();
     update(s => ({ ...s, activeConversationId: id, conversations: [
@@ -159,12 +160,13 @@ function useAppController() {
       ? s : { ...s, activeConversationId: id });
   }
   function renameConversation(id: string, title: string) {
+    if (activeRequest.current || accountTask.current) return;
     const value = title.trim().slice(0, 80);
     if (!value) return;
     update(s => ({ ...s, conversations: s.conversations.map(c => c.id === id && c.title !== value ? { ...c, title: value } : c) }));
   }
   function removeConversation(id: string) {
-    if (activeRequest.current) return;
+    if (activeRequest.current || accountTask.current) return;
     for (const item of draftsRef.current[id] ?? []) disposeAttachmentCache(item);
     setConversationDrafts(id, []);
     setConversationText(id, '');
@@ -174,8 +176,38 @@ function useAppController() {
     });
   }
   function changeSettings(settings: Partial<Settings>) {
+    if (activeRequest.current || accountTask.current) return;
     update(s => Object.entries(settings).every(([key, value]) => s.settings[key as keyof Settings] === value)
       ? s : { ...s, settings: { ...s.settings, ...settings } });
+  }
+
+  async function deleteMessages(conversationId: string, messageIds: string[]): Promise<boolean> {
+    if (activeRequest.current || working || accountTask.current || !messageIds.length) return false;
+    accountTask.current = true;
+    setWorking(true); setNotice('');
+    let removedFromView = false;
+    try {
+      await yieldToUi();
+      const conversation = current.current.conversations.find(item => item.id === conversationId);
+      if (!conversation) { setNotice('这段对话已不存在。'); return false; }
+      const result = deleteConversationMessages(conversation, messageIds);
+      if (!result.deletedCount) return false;
+      // Publish the new immutable state first, so autosave/background flush can
+      // never enqueue a fresh snapshot containing the removed messages.
+      update(before => ({ ...before, conversations: before.conversations.map(item => item.id === conversationId ? result.conversation : item) }));
+      removedFromView = true;
+      await saveState(current.current);
+      setSaveError('');
+      setNotice(`已删除 ${result.deletedCount} 条消息，后续请求不再携带这些消息。${result.originalDataDropped ? '为避免旧内容随备份恢复，已移除无法按消息清理的原始导入副本；其余可见消息保留。' : ''}`);
+      return true;
+    } catch {
+      if (removedFromView) {
+        // A commit may have succeeded before the filesystem reported failure.
+        // Never restore the old in-memory snapshot and resurrect deleted text.
+        setSaveError('删除尚未确认保存成功，请保留当前页面并点击重试保存。');
+      } else setNotice('未能删除消息，已有记录未修改。');
+      return false;
+    } finally { accountTask.current = false; setWorking(false); }
   }
 
   async function connect(key: string) {
@@ -275,7 +307,7 @@ function useAppController() {
     if (retry) {
       const last = base.at(-1);
       const previous = base.at(-2);
-      if (last?.role !== 'assistant' || !['error', 'stopped'].includes(last.status) || previous?.role !== 'user') return false;
+      if (last?.role !== 'assistant' || last.contextBoundaryBefore || !['error', 'stopped'].includes(last.status) || previous?.role !== 'user') return false;
       text = previous.content;
       attachments = previous.attachments ?? [];
       base = base.slice(0, -2);
@@ -496,6 +528,7 @@ function useAppController() {
     selectConversation: useLatestCallback(selectConversation),
     renameConversation: useLatestCallback(renameConversation),
     removeConversation: useLatestCallback(removeConversation),
+    deleteMessages: useLatestCallback(deleteMessages),
     changeSettings: useLatestCallback(changeSettings),
     connect: useLatestCallback(connect),
     refreshBalance: useLatestCallback(refreshBalance),

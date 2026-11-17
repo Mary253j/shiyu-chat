@@ -22,6 +22,8 @@ export interface Message {
   error?: string;
   attachments?: MessageAttachment[];
   contextUsage?: ContextUsage;
+  /** A deleted gap before this message must not reconnect unrelated turns. */
+  contextBoundaryBefore?: boolean;
 }
 
 export interface Conversation {
@@ -33,6 +35,8 @@ export interface Conversation {
   sourceId?: string;
   importWarnings?: string[];
   originalData?: unknown;
+  /** Monotonic marker used to retire snapshots that still contain deleted messages. */
+  redactionRevision?: number;
 }
 
 export interface Settings {

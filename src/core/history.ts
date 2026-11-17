@@ -412,8 +412,17 @@ function backupContextUsage(value: unknown): ContextUsage {
     ...(item.reason === undefined ? {} : { reason: item.reason as string }) };
 }
 
+function validateRedactionRevision(value: unknown): void {
+  if (value !== undefined && (!Number.isSafeInteger(value) || Number(value) < 0)) fail('备份删除版本无效。');
+}
+
+function validateContextBoundary(value: unknown): void {
+  if (value !== undefined && typeof value !== 'boolean') fail('备份消息边界无效。');
+}
+
 function backupConversation(value: unknown, budget: Budget): Conversation {
   const raw = row(value, '备份会话'); const id = idValue(raw.id, '备份会话 ID');
+  validateRedactionRevision(raw.redactionRevision);
   const createdAt = raw.createdAt; const updatedAt = raw.updatedAt;
   if (typeof createdAt !== 'number' || typeof updatedAt !== 'number' || !Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || createdAt < 0 || updatedAt < 0) fail('备份会话时间无效。');
   const items = list(raw.messages, '备份消息'); checkBudget(budget, items.length);
@@ -424,6 +433,7 @@ function backupConversation(value: unknown, budget: Budget): Conversation {
     if (item.role !== 'user' && item.role !== 'assistant') fail('备份消息角色无效。');
     if (typeof item.createdAt !== 'number' || !Number.isFinite(item.createdAt) || item.createdAt < 0) fail('备份消息时间无效。');
     if (item.contextEligible !== undefined && typeof item.contextEligible !== 'boolean') fail('备份上下文标识无效。');
+    validateContextBoundary(item.contextBoundaryBefore);
     const status = messageStatus(item.status, true);
     let attachments: Message['attachments'];
     if (item.attachments !== undefined) {
@@ -437,11 +447,14 @@ function backupConversation(value: unknown, budget: Budget): Conversation {
       ...(item.error === undefined ? {} : { error: textValue(item.error, '备份错误提示') }),
       ...(attachments === undefined ? {} : { attachments }),
       ...(item.contextUsage === undefined ? {} : { contextUsage: backupContextUsage(item.contextUsage) }),
-      contextEligible: status !== 'error' && status !== 'refused' && item.contextEligible !== false,
+      ...(item.contextBoundaryBefore === undefined ? {} : { contextBoundaryBefore: item.contextBoundaryBefore as boolean }),
+      contextEligible: status === 'complete' ? item.contextEligible !== false
+        : status === 'stopped' && String(item.status).toUpperCase() !== 'STREAMING' && item.contextEligible === true,
     };
   });
   for (let i = 1; i < messages.length; i++) {
-    if (messages[i].role === 'assistant' && !messages[i].contextEligible && messages[i - 1].role === 'user') messages[i - 1].contextEligible = false;
+    if (messages[i].role === 'assistant' && !messages[i].contextEligible && !messages[i].contextBoundaryBefore
+      && messages[i - 1].role === 'user') messages[i - 1].contextEligible = false;
   }
   const importWarnings = raw.importWarnings === undefined ? undefined : list(raw.importWarnings, '导入提醒').map((value) => textValue(value, '导入提醒'));
   return {
@@ -449,6 +462,7 @@ function backupConversation(value: unknown, budget: Budget): Conversation {
     ...(raw.sourceId === undefined ? {} : { sourceId: idValue(raw.sourceId, '来源 ID') }),
     ...(importWarnings ? { importWarnings } : {}),
     ...(raw.originalData === undefined ? {} : { originalData: raw.originalData }),
+    ...(raw.redactionRevision === undefined ? {} : { redactionRevision: raw.redactionRevision as number }),
   };
 }
 
@@ -538,6 +552,11 @@ export function mergeConversations(existing: Conversation[], incoming: Conversat
 
 /** The app backup includes only app state; API credentials are stored elsewhere. */
 export function exportHistory(state: AppState): string {
+  // Validate before serialization: JSON would silently omit functions/symbols.
+  for (const conversation of state.conversations) {
+    validateRedactionRevision(conversation.redactionRevision);
+    for (const message of conversation.messages) validateContextBoundary(message.contextBoundaryBefore);
+  }
   const result = JSON.stringify({
     schemaVersion: 1,
     conversations: state.conversations.map(conversation => ({ ...conversation,

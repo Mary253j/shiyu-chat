@@ -2,13 +2,13 @@
   "expo": {
     "name": "拾语",
     "slug": "shiyu-chat",
-    "version": "0.1.4",
+    "version": "0.1.5",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "android": {
       "package": "com.shiyu.chat",
-      "versionCode": 5,
+      "versionCode": 6,
       "allowBackup": false,
       "permissions": [
         "android.permission.INTERNET"
@@ -22,7 +22,8 @@
       "adaptiveIcon": {
         "backgroundColor": "#315C4C",
         "foregroundImage": "./assets/android-icon-foreground.png"
-      }
+      },
+      "softwareKeyboardLayoutMode": "resize"
     },
     "web": {
       "favicon": "./assets/favicon.png",

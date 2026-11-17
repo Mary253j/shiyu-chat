@@ -1,6 +1,6 @@
-import React, { memo, useCallback, useDeferredValue, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator, FlatList, Image, KeyboardAvoidingView, Linking, Modal, Platform, Pressable,
+  ActivityIndicator, FlatList, Image, Keyboard, KeyboardAvoidingView, Linking, Modal, Platform, Pressable,
   ScrollView, StyleSheet, Switch, Text, TextInput, useWindowDimensions, View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -14,6 +14,7 @@ import ChatMessages from './ChatMessages';
 
 type Page = 'chat' | 'library' | 'settings' | 'support';
 type IconName = React.ComponentProps<typeof Feather>['name'];
+type ConfirmationValue = { title: string; description: string; action: () => void | Promise<void>; destructive?: boolean; confirmLabel?: string };
 const colors = { bg: '#FAF9F6', paper: '#FFFFFF', ink: '#253C36', muted: '#738079', green: '#315C4C', pale: '#EDF3EE', line: '#E5E9E2', warm: '#F3EBDD' };
 const routes = { chat: '/', library: '/library', settings: '/settings', support: '/support' } as const;
 const emptyMessages: Message[] = [];
@@ -56,9 +57,16 @@ export default function MainScreen({ page = 'chat' }: { page?: Page }) {
   const [showKey, setShowKey] = useState(false);
   const [rename, setRename] = useState<Conversation | null>(null);
   const [newTitle, setNewTitle] = useState('');
-  const [confirm, setConfirm] = useState<{ title: string; description: string; action: () => void | Promise<void>; destructive?: boolean } | null>(null);
+  const [confirm, setConfirm] = useState<ConfirmationValue | null>(null);
   const [privacy, setPrivacy] = useState(false);
   const [followRequest, setFollowRequest] = useState(0);
+  const [keyboardVisible, setKeyboardVisible] = useState(() => Platform.OS !== 'web' && Keyboard.isVisible());
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    const show = Keyboard.addListener('keyboardDidShow', () => setKeyboardVisible(true));
+    const hide = Keyboard.addListener('keyboardDidHide', () => setKeyboardVisible(false));
+    return () => { show.remove(); hide.remove(); };
+  }, []);
   const actions = useRef(app);
   useLayoutEffect(() => { actions.current = app; });
   const messages = app.active?.messages ?? emptyMessages;
@@ -102,8 +110,36 @@ export default function MainScreen({ page = 'chat' }: { page?: Page }) {
     } });
   }, []);
   const onRetryMessage = useCallback((content: string) => {
+    if (actions.current.busy || actions.current.working || actions.current.attachmentsBusy) return;
     setFollowRequest(value => value + 1);
     void actions.current.send(content, true);
+  }, []);
+  const onDeleteMessages = useCallback((ids: string[], onDeleted?: () => void) => {
+    const current = actions.current;
+    if (current.busy || current.working || current.attachmentsBusy || !current.active) return;
+    // Bind the confirmation to this conversation, even if navigation changes
+    // before the user confirms. Only the explicitly chosen messages are removed.
+    const conversationId = current.active.id;
+    const messageIds = [...new Set(ids)];
+    if (!messageIds.length) return;
+    const selectedIds = new Set(messageIds);
+    const hasAttachments = current.active.messages.some(message => selectedIds.has(message.id) && !!message.attachments?.length);
+    const description = [
+      `将仅删除选中的 ${messageIds.length} 条消息，无法撤销；未选中的聊天消息保留。删除的消息不会再带入后续聊天请求或新导出的备份。若回复中引用了误发内容，可一起选中删除。`,
+      current.active.originalData !== undefined ? '会同步清理导入副本中的对应记录；无法识别的原始副本将移除，未选中的聊天消息保留。' : '',
+      hasAttachments ? '不会删除 DeepSeek 账户中的附件原件。' : '',
+    ].filter(Boolean).join('\n\n');
+    setConfirm({ title: `删除 ${messageIds.length} 条消息？`, description, destructive: true, confirmLabel: '确认删除消息', action: async () => {
+      const deleted = await actions.current.deleteMessages(conversationId, messageIds);
+      if (!deleted) {
+        // A storage error may leave the chosen rows removed in memory. Do not
+        // keep invisible IDs selected while the user retries saving that state.
+        const remaining = actions.current.state.conversations.find(conversation => conversation.id === conversationId);
+        if (remaining && !remaining.messages.some(message => selectedIds.has(message.id))) onDeleted?.();
+        throw new Error('message-deletion-not-completed');
+      }
+      onDeleted?.();
+    } });
   }, []);
   const renderConversation = useCallback(({ item }: { item: Conversation }) => (
     <ConversationRow conversation={item} busy={app.busy} onOpen={openConversation} onRename={beginRename} onRemove={beginRemove} />
@@ -143,7 +179,11 @@ export default function MainScreen({ page = 'chat' }: { page?: Page }) {
     <Confirmation value={confirm} onClose={() => setConfirm(null)} />
   </SafeAreaView>;
 
-  return <SafeAreaView style={s.safe} edges={['top', 'bottom']}>
+  // The root view starts at the screen origin (the Router header is hidden),
+  // so padding is calculated in the keyboard's screen coordinates. Android
+  // edge-to-edge no longer resizes this view automatically for the IME.
+  return <KeyboardAvoidingView testID="keyboard-avoiding-screen" style={s.safe} behavior={Platform.OS === 'web' ? undefined : 'padding'}>
+    <SafeAreaView style={s.safe} edges={keyboardVisible ? ['top'] : ['top', 'bottom']}>
     <View style={s.appRow}>
       {wide && <View style={s.sidebar}>
         <View style={s.brand}><View style={s.brandMark}><Icon name="message-circle" color="#fff" size={25} /></View><View><Text style={s.brandName}>拾语</Text><Text style={s.brandSub}>把故事，接着聊。</Text></View></View>
@@ -163,9 +203,10 @@ export default function MainScreen({ page = 'chat' }: { page?: Page }) {
         {!!app.notice && <View style={s.notice}><Text style={[s.small, { flex: 1 }]}>{app.notice}</Text><SmallButton icon="x" label="关闭提示" onPress={() => app.setNotice('')} /></View>}
         {!!app.saveError && <Pressable onPress={app.retrySave} style={s.errorBanner}><Text style={s.errorText}>{app.saveError} 点击重试</Text></Pressable>}
 
-        {page === 'chat' && <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        {page === 'chat' && <View style={s.chat}>
           {messages.length ? <ChatMessages key={app.active?.id} messages={messages} busy={app.busy} wide={wide}
             followRequest={followRequest} onCopy={onCopyMessage} onLink={onMessageLink} onRetry={onRetryMessage}
+            actionsDisabled={sending || app.working} onDeleteMessages={onDeleteMessages}
           /> : <ScrollView contentContainerStyle={s.welcomeScroll}>
             <View style={s.welcome}>
               <View style={s.welcomeIcon}><Icon name="feather" size={34} /></View>
@@ -179,7 +220,7 @@ export default function MainScreen({ page = 'chat' }: { page?: Page }) {
               <View style={s.privacyNote}><Icon name="lock" size={13} color={colors.muted} /><Text style={s.tiny}>本机保存 · 无广告 · 软件免费</Text></View>
             </View>
           </ScrollView>}
-          <View style={[s.composerArea, { paddingHorizontal: wide ? 36 : 14 }]}>
+          <View testID="chat-composer" style={[s.composerArea, { paddingHorizontal: wide ? 36 : 14 }]}>
             <View style={s.composer}>
               {hasDraftAttachments && <View style={s.attachmentsArea}>
                 <ScrollView style={s.draftAttachments} keyboardShouldPersistTaps="handled" nestedScrollEnabled>
@@ -217,7 +258,7 @@ export default function MainScreen({ page = 'chat' }: { page?: Page }) {
             <Pressable accessibilityRole="button" accessibilityLabel="查看上下文设置" onPress={() => go('settings')} style={s.contextSettingLink}><Text style={s.tiny}>{contextMode === 'auto' ? '上下文：自动尽量携带当前对话' : `上下文：限制最近 ${app.state.settings.contextMessageLimit} 条消息`} · 查看设置</Text></Pressable>
             <Text style={s.composerFootnote}>软件免费，API 按用量付费 · 回复由 AI 生成，请自行判断</Text>
           </View>
-        </KeyboardAvoidingView>}
+        </View>}
 
         {page === 'library' && <FlatList<Conversation> testID="conversation-list" data={filtered} keyExtractor={conversation => conversation.id}
           renderItem={renderConversation} extraData={app.busy} style={{ flex: 1 }} contentContainerStyle={s.libraryContent}
@@ -260,13 +301,14 @@ export default function MainScreen({ page = 'chat' }: { page?: Page }) {
         {page === 'support' && <ScrollView contentContainerStyle={s.pageContent}><SupportPanel /></ScrollView>}
       </View>
     </View>
-    {!wide && <View style={s.bottomNav}>{[...nav, { page: 'support' as Page, label: '支持作者', icon: 'heart' as IconName }].map(item => <Pressable key={item.page} accessibilityRole="tab" accessibilityState={{ selected: page === item.page }} accessibilityLabel={item.label} onPress={() => go(item.page)} style={s.bottomNavItem}><Icon name={item.icon} color={page === item.page ? colors.green : '#99A29B'} size={21} /><Text style={[s.bottomLabel, page === item.page && { color: colors.green, fontWeight: '700' }]}>{item.label}</Text></Pressable>)}</View>}
+    {!wide && !keyboardVisible && <View testID="bottom-navigation" style={s.bottomNav}>{[...nav, { page: 'support' as Page, label: '支持作者', icon: 'heart' as IconName }].map(item => <Pressable key={item.page} accessibilityRole="tab" accessibilityState={{ selected: page === item.page }} accessibilityLabel={item.label} onPress={() => go(item.page)} style={s.bottomNavItem}><Icon name={item.icon} color={page === item.page ? colors.green : '#99A29B'} size={21} /><Text style={[s.bottomLabel, page === item.page && { color: colors.green, fontWeight: '700' }]}>{item.label}</Text></Pressable>)}</View>}
 
     <Confirmation value={confirm} onClose={() => setConfirm(null)} />
     <Modal visible={!!rename} transparent animationType="fade" onRequestClose={() => setRename(null)}><View style={s.overlay}><View style={s.dialog}><Text style={s.sectionTitle}>给这段对话起个名字</Text><TextInput style={s.dialogInput} value={newTitle} onChangeText={setNewTitle} maxLength={80} autoFocus accessibilityLabel="对话名称" /><View style={s.rowWrap}><Button secondary text="取消" onPress={() => setRename(null)} /><Button text="保存名称" disabled={!newTitle.trim()} onPress={() => { if (rename) app.renameConversation(rename.id, newTitle); setRename(null); }} /></View></View></View></Modal>
     <Modal visible={!!app.preview} transparent animationType="fade" onRequestClose={() => app.setPreview(null)}><View style={s.overlay}><View style={[s.dialog, { maxHeight: '85%' }]}><Text style={s.sectionTitle}>先看看，要带回哪些故事</Text><Text style={s.body}>识别到 {app.preview?.conversations.length} 段对话、{app.preview?.messageCount} 条消息。</Text><ScrollView style={{ maxHeight: 300 }}>{app.preview?.warnings.map((warning, index) => <Text key={index} style={s.warningText}>• {warning}</Text>)}{app.preview?.conversations.slice(0, 12).map(c => <Text key={c.id} style={[s.small, { marginVertical: 5 }]} numberOfLines={1}>▤  {c.title}</Text>)}</ScrollView><Text style={s.tiny}>合并导入，保留已有对话。重复来源会跳过，不自动覆盖。</Text><View style={s.rowWrap}><Button secondary text="先不导入" onPress={() => app.setPreview(null)} /><Button text="确认合并导入" icon="download" onPress={app.confirmImport} disabled={app.busy} /></View></View></View></Modal>
     <Modal visible={privacy} transparent animationType="fade" onRequestClose={() => setPrivacy(false)}><View style={s.overlay}><View style={s.dialog}><Text style={s.sectionTitle}>你的记录，你来掌握</Text><Text style={s.body}>• 安卓聊天记录在本机加密保存，密钥由系统安全存储保管。{ '\n\n' }• 发消息时，当前问题、选定范围的历史和附件会直接发送给 DeepSeek，用于生成回答。附件保存在你的 DeepSeek 账户，文档解析和聊天按官方计费。不会经过作者的聊天服务器。{ '\n\n' }• 不接入广告、追踪或云同步。导出备份是明文文件，包含聊天与导入原记录；新附件仅备份文件引用，不包含原件，请妥善保管。{ '\n\n' }• 可以移除 Key 或清除本机数据。撤销官方 Key、删除 DeepSeek 平台的数据需到官方平台操作。</Text><Button text="我知道了" onPress={() => setPrivacy(false)} /></View></View></Modal>
-  </SafeAreaView>;
+    </SafeAreaView>
+  </KeyboardAvoidingView>;
 }
 
 function lastUserPreview(messages: Message[]): string {
@@ -292,18 +334,18 @@ const ConversationRow = memo(function ConversationRow({ conversation, busy, onOp
   </View>;
 });
 
-function Confirmation({ value, onClose }: { value: { title: string; description: string; action: () => void | Promise<void>; destructive?: boolean } | null; onClose: () => void }) {
+function Confirmation({ value, onClose }: { value: ConfirmationValue | null; onClose: () => void }) {
   const [running, setRunning] = useState(false);
   const [error, setError] = useState('');
   function close() { setError(''); onClose(); }
-  return <Modal visible={!!value} transparent animationType="fade" onRequestClose={() => { if (!running) close(); }}><View style={s.overlay}><View style={s.dialog}><Text style={s.sectionTitle}>{value?.title}</Text><Text style={s.body}>{value?.description}</Text>{!!error && <Text style={s.errorText}>{error}</Text>}<View style={s.rowWrap}><Button text="取消" secondary disabled={running} onPress={close} /><Button text={running ? '处理中…' : value?.destructive ? '确认清除' : '继续'} danger={value?.destructive} disabled={running} onPress={() => {
+  return <Modal visible={!!value} transparent animationType="fade" onRequestClose={() => { if (!running) close(); }}><View style={s.overlay}><View style={s.dialog}><Text style={s.sectionTitle}>{value?.title}</Text><Text style={s.body}>{value?.description}</Text>{!!error && <Text style={s.errorText}>{error}</Text>}<View style={s.rowWrap}><Button text="取消" secondary disabled={running} onPress={close} /><Button text={running ? '处理中…' : value?.confirmLabel ?? (value?.destructive ? '确认清除' : '继续')} danger={value?.destructive} disabled={running} onPress={() => {
     setRunning(true); setError('');
     Promise.resolve().then(() => value?.action()).then(onClose).catch(() => setError('操作未完成，请重试。')).finally(() => setRunning(false));
   }} /></View></View></View></Modal>;
 }
 
 const s = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: colors.bg }, center: { justifyContent: 'center', alignItems: 'center' }, appRow: { flex: 1, flexDirection: 'row' }, main: { flex: 1, minWidth: 0 },
+  safe: { flex: 1, backgroundColor: colors.bg }, center: { justifyContent: 'center', alignItems: 'center' }, appRow: { flex: 1, flexDirection: 'row', minHeight: 0 }, main: { flex: 1, minWidth: 0, minHeight: 0 }, chat: { flex: 1, minHeight: 0 },
   sidebar: { width: 270, backgroundColor: '#F1F3EC', borderRightWidth: 1, borderRightColor: colors.line, padding: 23, gap: 22 },
   brand: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 8, marginBottom: 10 }, brandMark: { width: 46, height: 46, borderRadius: 16, backgroundColor: colors.green, alignItems: 'center', justifyContent: 'center' }, brandName: { fontSize: 25, fontWeight: '700', color: colors.ink, letterSpacing: 3 }, brandSub: { fontSize: 11, color: colors.muted, marginTop: 3 },
   button: { backgroundColor: colors.green, minHeight: 46, paddingVertical: 12, paddingHorizontal: 18, borderRadius: 13, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 9 }, buttonSecondary: { backgroundColor: colors.pale, borderWidth: 1, borderColor: colors.line }, buttonDanger: { backgroundColor: '#A55344' }, buttonText: { color: '#fff', fontSize: 14, fontWeight: '600' }, iconButton: { padding: 10, minWidth: 40, minHeight: 40, justifyContent: 'center', alignItems: 'center' },

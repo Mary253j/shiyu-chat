@@ -275,3 +275,162 @@ test('review: orphan first-save files block automatic empty-state replacement', 
   await assert.rejects(store.saveState(emptyState()), /中断的首次保存/);
   assert.deepEqual(env.snapshot(), before);
 });
+
+/** Provider owns source-node redaction; this fixture supplies its already-cleaned immutable result. */
+function redactFirst(state: AppState): AppState {
+  const original = state.conversations[0];
+  return { ...state, conversations: [{ ...original,
+    redactionRevision: (original.redactionRevision ?? 0) + 1,
+    messages: original.messages.filter(message => message.id !== 'a1'),
+    originalData: { remainingSource: '只保留未删除的原始资料' },
+  }, ...state.conversations.slice(1)] };
+}
+
+test('review: deleting messages discards every older body, original and legacy snapshot', async () => {
+  const env = environment(); const initial = fixture(); env.legacy(initial);
+  const store = createStateStore(env.io); await store.saveState(initial);
+  const old = await env.latest();
+  assert.equal(old.manifest.conversations[0].redactionRevision, undefined);
+  const redacted = redactFirst(initial); await store.saveState(redacted);
+  const current = await env.latest(); const first = current.manifest.conversations[0];
+  assert.equal(first.redactionRevision, 1);
+  assert.equal(current.manifest.previousIndex, null); assert.equal(current.manifest.legacyFallback, null);
+  assert.ok(!env.files.has(old.name)); assert.ok(!env.files.has('state-100.enc'));
+  assert.ok(!env.files.has(old.manifest.conversations[0].recordFile));
+  assert.ok(!env.files.has(old.manifest.conversations[0].originalFile!));
+  assert.notEqual(first.originalFile, old.manifest.conversations[0].originalFile);
+  assert.deepEqual(current.manifest.conversations[1], old.manifest.conversations[1]);
+  assert.deepEqual(new Set(env.files.keys()), new Set([current.name, first.recordFile, first.originalFile!, current.manifest.conversations[1].recordFile]));
+  assert.deepEqual(await createStateStore(env.io).loadState(), redacted);
+});
+
+test('review: a deletion before first v2 migration never retains the unredacted v1 fallback', async () => {
+  const env = environment(); env.legacy(fixture()); const store = createStateStore(env.io);
+  const redacted = redactFirst(await store.loadState()); await store.saveState(redacted);
+  const current = await env.latest();
+  assert.equal(current.manifest.conversations[0].redactionRevision, 1);
+  assert.equal(current.manifest.legacyFallback, null);
+  assert.ok(!env.files.has('state-100.enc'));
+  assert.deepEqual(await createStateStore(env.io).loadState(), redacted);
+});
+
+test('review: redaction cleanup failures retry on unchanged save and restart without restoring originals', async () => {
+  for (const restart of [false, true]) {
+    const env = environment(); const initial = fixture(); env.legacy(initial);
+    const store = createStateStore(env.io); await store.saveState(initial); const old = await env.latest();
+    env.setHook(operation => { if (operation === 'remove') throw new Error('Cleanup unavailable'); });
+    const redacted = redactFirst(initial); await store.saveState(redacted); const committed = await env.latest();
+    assert.ok(env.files.has(old.name)); assert.ok(env.files.has(old.manifest.conversations[0].originalFile!));
+    // The readable current state is already redacted even while old-file removal fails.
+    if (restart) assert.deepEqual(await createStateStore(env.io).loadState(), redacted);
+    env.setHook(() => undefined);
+    if (restart) assert.deepEqual(await createStateStore(env.io).loadState(), redacted);
+    else await store.saveState(redacted);
+    assert.equal((await env.latest()).name, committed.name);
+    assert.ok(!env.files.has(old.name)); assert.ok(!env.files.has('state-100.enc'));
+    assert.ok(!env.files.has(old.manifest.conversations[0].recordFile));
+    assert.ok(!env.files.has(old.manifest.conversations[0].originalFile!));
+  }
+});
+
+test('review: redaction intent survives failed index commits and cache reloads', async () => {
+  for (const phase of ['before', 'after'] as const) {
+    const env = environment(); const initial = fixture(); const store = createStateStore(env.io);
+    await store.saveState(initial); const old = await env.latest(); const redacted = redactFirst(initial);
+    let fired = false;
+    env.setHook((operation, name, moment) => {
+      if (!fired && operation === 'move' && name.startsWith('index-') && moment === phase) {
+        fired = true; throw new Error('Commit response lost');
+      }
+    });
+    await assert.rejects(store.saveState(redacted), /Commit response lost/);
+    env.setHook(() => undefined);
+    // The same immutable redaction must be compared to the persisted index, not the old stateRef.
+    await store.saveState(redacted);
+    assert.deepEqual(await createStateStore(env.io).loadState(), redacted);
+    assert.equal((await env.latest()).manifest.conversations[0].redactionRevision, 1);
+    assert.ok(!env.files.has(old.name));
+    assert.ok(!env.files.has(old.manifest.conversations[0].recordFile));
+    assert.ok(!env.files.has(old.manifest.conversations[0].originalFile!));
+    await assert.rejects(store.saveState(initial), /删除前的旧消息快照/);
+    assert.deepEqual(await createStateStore(env.io).loadState(), redacted);
+  }
+});
+
+test('review: queued stale saves cannot resurrect messages after a later redaction commits', async () => {
+  const env = environment(); const initial = fixture(); const store = createStateStore(env.io);
+  await store.saveState(initial);
+  const reached = deferred(); const release = deferred(); let blocked = false;
+  env.setHook(async (operation, name) => {
+    if (!blocked && operation === 'encrypt' && name.startsWith('record:')) {
+      blocked = true; reached.resolve(); await release.promise;
+    }
+  });
+  const earlier = { ...initial, conversations: [{ ...initial.conversations[0], title: '删除前的待保存标题' }, initial.conversations[1]] };
+  const redacted = redactFirst(earlier);
+  const writing = store.saveState(earlier); await reached.promise;
+  const deleting = store.saveState(redacted);
+  const staleResult = store.saveState(earlier).then(() => null, error => error);
+  release.resolve(); await Promise.all([writing, deleting]);
+  assert.match(String(await staleResult), /删除前的旧消息快照/);
+  env.setHook(() => undefined);
+  assert.deepEqual(await createStateStore(env.io).loadState(), redacted);
+  assert.equal((await env.latest()).manifest.previousIndex, null);
+});
+
+test('review: failed clear retains the committed redaction and rejects earlier snapshots after restart', async () => {
+  const env = environment(); const initial = fixture(); const store = createStateStore(env.io);
+  await store.saveState(initial); const redacted = redactFirst(initial); await store.saveState(redacted);
+  env.setHook(operation => { if (operation === 'clearFiles') throw new Error('Disk deletion failed'); });
+  await assert.rejects(store.deleteAllLocalData(), /Disk deletion failed/);
+  assert.equal(env.hasSecret(), true); env.setHook(() => undefined);
+  const restarted = createStateStore(env.io);
+  assert.deepEqual(await restarted.loadState(), redacted);
+  await assert.rejects(restarted.saveState(initial), /删除前的旧消息快照/);
+  assert.deepEqual(await createStateStore(env.io).loadState(), redacted);
+});
+
+test('review: malformed or mismatched redaction revisions fail closed without old-generation fallback', async () => {
+  for (const revision of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, '1', null]) {
+    const env = environment(); const initial = fixture(); env.legacy(initial);
+    await createStateStore(env.io).saveState(initial);
+    const latest = await env.latest();
+    (latest.manifest.conversations[0] as unknown as { redactionRevision: unknown }).redactionRevision = revision;
+    env.files.set(latest.name, await env.io.encrypt(JSON.stringify(latest.manifest), `index:${latest.name}`));
+    const before = env.snapshot(); const store = createStateStore(env.io);
+    await assert.rejects(store.loadState(), /引用无效/);
+    await assert.rejects(store.saveState(emptyState()), /引用无效/);
+    assert.deepEqual(env.snapshot(), before);
+  }
+  const env = environment(); await createStateStore(env.io).saveState(fixture());
+  const latest = await env.latest(); const reference = latest.manifest.conversations[0];
+  const context = `record:${reference.id}:${reference.recordFile}`;
+  const body = JSON.parse(await env.io.decrypt(env.files.get(reference.recordFile)!, context));
+  body.conversation.redactionRevision = 1;
+  env.files.set(reference.recordFile, await env.io.encrypt(JSON.stringify(body), context));
+  await assert.rejects(createStateStore(env.io).loadState(), /内容不匹配/);
+});
+
+test('review: cleanup never keeps a predecessor with an older message-deletion revision', async () => {
+  const env = environment(); const initial = fixture(); const store = createStateStore(env.io);
+  await store.saveState(initial); const old = await env.latest();
+  env.setHook(operation => { if (operation === 'remove') throw new Error('Cleanup unavailable'); });
+  const redacted = redactFirst(initial); await store.saveState(redacted); const latest = await env.latest();
+  // A stale retention pointer must not bypass the revision rule merely because IDs match.
+  latest.manifest.previousIndex = old.name;
+  env.files.set(latest.name, await env.io.encrypt(JSON.stringify(latest.manifest), `index:${latest.name}`));
+  env.setHook(() => undefined);
+  assert.deepEqual(await createStateStore(env.io).loadState(), redacted);
+  assert.ok(!env.files.has(old.name)); assert.ok(!env.files.has(old.manifest.conversations[0].originalFile!));
+});
+
+test('review: deleting a local message reuses unaffected original data but removes the older message body', async () => {
+  const env = environment(); const initial = fixture(); const store = createStateStore(env.io);
+  await store.saveState(initial); const old = await env.latest();
+  const redacted = redactFirst(initial);
+  redacted.conversations[0] = { ...redacted.conversations[0], originalData: initial.conversations[0].originalData };
+  await store.saveState(redacted); const latest = await env.latest();
+  assert.equal(latest.manifest.conversations[0].originalFile, old.manifest.conversations[0].originalFile);
+  assert.ok(!env.files.has(old.manifest.conversations[0].recordFile));
+  assert.equal(latest.manifest.previousIndex, null);
+});

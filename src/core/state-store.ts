@@ -6,6 +6,8 @@ export interface StoredConversationRef {
   id: string;
   recordFile: string;
   originalFile?: string;
+  /** Monotonic deletion version; old manifests without it are revision zero. */
+  redactionRevision?: number;
 }
 
 export interface StateManifest {
@@ -77,7 +79,8 @@ function assertConversation(value: unknown): asserts value is Conversation {
   assertRecord(value);
   if (typeof value.id !== 'string' || !value.id || typeof value.title !== 'string'
     || !Number.isFinite(value.createdAt) || !Number.isFinite(value.updatedAt)
-    || !Array.isArray(value.messages)) throw new Error('本地会话格式无效。');
+    || !Array.isArray(value.messages)
+    || !validRedactionRevision(value.redactionRevision)) throw new Error('本地会话格式无效。');
   for (const message of value.messages) {
     assertRecord(message);
     if (typeof message.id !== 'string' || !['user', 'assistant'].includes(String(message.role))
@@ -87,6 +90,14 @@ function assertConversation(value: unknown): asserts value is Conversation {
       throw new Error('本地消息格式无效。');
     }
   }
+}
+
+function validRedactionRevision(value: unknown): value is number | undefined {
+  return value === undefined || (Number.isSafeInteger(value) && Number(value) >= 0);
+}
+
+function redactionRevision(value: { redactionRevision?: number }): number {
+  return value.redactionRevision ?? 0;
 }
 
 function generationOf(name: string, pattern: RegExp): number | null {
@@ -117,6 +128,7 @@ function parseManifest(plaintext: string, name: string): StateManifest {
   for (const reference of value.conversations) {
     assertRecord(reference);
     if (typeof reference.id !== 'string' || !reference.id || ids.has(reference.id)
+      || !validRedactionRevision(reference.redactionRevision)
       || typeof reference.recordFile !== 'string' || !RECORD_PATTERN.test(reference.recordFile)
       || records.has(reference.recordFile)
       || (reference.originalFile !== undefined && (typeof reference.originalFile !== 'string'
@@ -161,6 +173,7 @@ export function createStateStore(io: StateStoreIO) {
   let manifestName: string | null = null;
   let predecessor: { name: string; manifest: StateManifest } | null = null;
   let legacyName: string | null = null;
+  let legacyRevisions = new Map<string, number>();
   let cache = new Map<string, CacheEntry>();
   let knownFiles = new Set<string>();
   let highestGeneration = 0;
@@ -179,6 +192,7 @@ export function createStateStore(io: StateStoreIO) {
     manifestName = null;
     predecessor = null;
     legacyName = null;
+    legacyRevisions = new Map();
     cache = new Map();
     knownFiles = new Set();
     highestGeneration = 0;
@@ -206,9 +220,9 @@ export function createStateStore(io: StateStoreIO) {
     addReferences(manifest);
     if (manifest.legacyFallback) keep.add(manifest.legacyFallback);
     if (predecessor && predecessor.name === manifest.previousIndex) {
-      // A predecessor must never retain a conversation deleted from the current index.
-      const ids = new Set(manifest.conversations.map(reference => reference.id));
-      if (predecessor.manifest.conversations.every(reference => ids.has(reference.id))) {
+      // A predecessor must not retain removed conversations or older versions of deleted messages.
+      const revisions = new Map(manifest.conversations.map(reference => [reference.id, redactionRevision(reference)]));
+      if (predecessor.manifest.conversations.every(reference => revisions.get(reference.id) === redactionRevision(reference))) {
         keep.add(predecessor.name);
         addReferences(predecessor.manifest);
       }
@@ -251,7 +265,8 @@ export function createStateStore(io: StateStoreIO) {
           assertRecord(body);
           if (body.storageVersion !== 2 || body.id !== reference.id) throw new Error('本地会话引用不匹配。');
           assertConversation(body.conversation);
-          if (body.conversation.id !== reference.id || body.conversation.originalData !== undefined) {
+          if (body.conversation.id !== reference.id || body.conversation.originalData !== undefined
+            || redactionRevision(body.conversation) !== redactionRevision(reference)) {
             throw new Error('本地会话内容不匹配。');
           }
           let originalData: unknown;
@@ -297,6 +312,7 @@ export function createStateStore(io: StateStoreIO) {
           assertConversation(conversation);
           if (ids.has(conversation.id)) throw new Error('本地会话编号重复。');
           ids.add(conversation.id);
+          legacyRevisions.set(conversation.id, redactionRevision(conversation));
           conversations.push(restoreInterrupted(conversation).conversation);
         }
         stateRef = { ...data, conversations };
@@ -336,13 +352,21 @@ export function createStateStore(io: StateStoreIO) {
     if (saveEpoch !== epoch || clearing) return;
     assertStateHeader(state);
     const ids = new Set<string>();
+    let redactedMessages = false;
     for (const conversation of state.conversations) {
       if (!conversation || typeof conversation.id !== 'string' || !conversation.id || ids.has(conversation.id)) {
         throw new Error('无法保存：会话编号无效或重复。');
       }
+      if (!validRedactionRevision(conversation.redactionRevision)) throw new Error('无法保存：消息删除版本无效。');
+      const persistedRevision = cache.has(conversation.id)
+        ? redactionRevision(cache.get(conversation.id)!.stored) : legacyRevisions.get(conversation.id) ?? 0;
+      const nextRevision = redactionRevision(conversation);
+      if (nextRevision < persistedRevision) throw new Error('无法保存删除前的旧消息快照，请重新读取当前记录。');
+      if (nextRevision > persistedRevision) redactedMessages = true;
       ids.add(conversation.id);
     }
-    const changed = state.conversations.filter(conversation => cache.get(conversation.id)?.bodyRef !== conversation);
+    const changed = state.conversations.filter(conversation => cache.get(conversation.id)?.bodyRef !== conversation
+      || redactionRevision(cache.get(conversation.id)?.stored ?? {}) !== redactionRevision(conversation));
     const sameOrder = manifest?.conversations.length === state.conversations.length
       && manifest.conversations.every((reference, index) => reference.id === state.conversations[index].id);
     if (manifest && changed.length === 0 && sameOrder
@@ -359,7 +383,7 @@ export function createStateStore(io: StateStoreIO) {
     let recordNumber = 0;
     for (const conversation of state.conversations) {
       const previous = cache.get(conversation.id);
-      if (previous?.bodyRef === conversation) {
+      if (previous?.bodyRef === conversation && redactionRevision(previous.stored) === redactionRevision(conversation)) {
         references.push(previous.stored);
         nextCache.set(conversation.id, previous);
         continue;
@@ -383,16 +407,18 @@ export function createStateStore(io: StateStoreIO) {
       const { originalData: _originalData, ...body } = conversation;
       const plaintext = JSON.stringify({ storageVersion: 2, id: conversation.id, conversation: body });
       if (!await writeEncrypted(recordFile, plaintext, `record:${conversation.id}:${recordFile}`, saveEpoch)) return;
-      const stored: StoredConversationRef = { id: conversation.id, recordFile, ...(originalFile ? { originalFile } : {}) };
+      const stored: StoredConversationRef = { id: conversation.id, recordFile, ...(originalFile ? { originalFile } : {}),
+        ...(conversation.redactionRevision === undefined ? {} : { redactionRevision: conversation.redactionRevision }) };
       references.push(stored);
       nextCache.set(conversation.id, { bodyRef: conversation, originalRef: conversation.originalData, stored });
     }
     const removedConversation = stateRef?.conversations.some(conversation => !ids.has(conversation.id)) ?? false;
+    const discardPrevious = removedConversation || redactedMessages;
     const next: StateManifest = {
       storageVersion: 2, schemaVersion: 1, generation,
       activeConversationId: state.activeConversationId, settings: { ...state.settings }, conversations: references,
-      previousIndex: removedConversation ? null : manifestName,
-      legacyFallback: !manifest && !removedConversation ? legacyName : null,
+      previousIndex: discardPrevious ? null : manifestName,
+      legacyFallback: !manifest && !discardPrevious ? legacyName : null,
     };
     const nextName = `index-${generation}.enc`;
     if (!await writeEncrypted(nextName, JSON.stringify(next), `index:${nextName}`, saveEpoch)) return;
@@ -403,6 +429,7 @@ export function createStateStore(io: StateStoreIO) {
     stateRef = state;
     cache = nextCache;
     legacyName = null;
+    legacyRevisions.clear();
     await cleanup();
   }
 
