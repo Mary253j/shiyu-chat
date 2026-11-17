@@ -1,12 +1,21 @@
-import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { AppState as NativeAppState, Platform } from 'react-native';
 import { fetch as expoFetch } from 'expo/fetch';
 import * as DocumentPicker from 'expo-document-picker';
 import { Directory, File, Paths } from 'expo-file-system';
 import { AppState, createId, emptyState, Message, Settings } from '../core/types';
 import { getBalance, streamChat } from '../core/deepseek';
+import { createStreamBuffer } from '../core/streamBuffer';
 import { exportHistory, mergeConversations, parseHistory, ImportPreview } from '../core/history';
 import { deleteAllLocalData, loadApiKey, loadState, saveApiKey, saveState } from './storage';
+
+function useLatestCallback<Args extends unknown[], Result>(callback: (...args: Args) => Result) {
+  const latest = useRef(callback);
+  useLayoutEffect(() => { latest.current = callback; }, [callback]);
+  return useCallback((...args: Args) => latest.current(...args), []);
+}
+
+const yieldToUi = () => new Promise<void>(resolve => setTimeout(resolve, 0));
 
 function useAppController() {
   const [state, setState] = useState<AppState>(emptyState);
@@ -22,33 +31,34 @@ function useAppController() {
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const activeRequest = useRef<AbortController | null>(null);
   const accountTask = useRef(false);
+  const initializing = useRef(false);
   const persistenceAllowed = useRef(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [saveRevision, setSaveRevision] = useState(0);
 
   function update(fn: (before: AppState) => AppState) {
     const next = fn(current.current);
+    if (next === current.current) return;
     current.current = next;
     setState(next);
   }
 
   async function initialize() {
+    if (initializing.current) return;
+    initializing.current = true;
     setLoadError('');
     try {
       const [stored, key] = await Promise.all([loadState(), loadApiKey()]);
-      const recovered: AppState = {
-        ...stored,
-        conversations: stored.conversations.map(c => ({ ...c, messages: c.messages.map(m =>
-          m.status === 'streaming' ? { ...m, status: 'stopped' as const, contextEligible: false } : m) })),
-      };
-      current.current = recovered;
-      setState(recovered);
+      // Storage recovers interrupted replies and retains unchanged object references.
+      // Cloning every conversation here would force a redundant full rewrite on startup.
+      current.current = stored;
+      setState(stored);
       setApiKey(key);
       persistenceAllowed.current = true;
       setReady(true);
     } catch {
       setLoadError('本机记录暂时无法读取。为保护已有内容，已停止写入。请先重试；清除数据会删除本机聊天和密钥。');
-    }
+    } finally { initializing.current = false; }
   }
 
   useEffect(() => { void initialize(); return () => activeRequest.current?.abort(); }, []);
@@ -59,7 +69,7 @@ function useAppController() {
       if (!persistenceAllowed.current) return;
       void saveState(current.current).then(() => setSaveError('')).catch(() =>
         setSaveError('记录暂未保存成功，请保留当前页面并重试保存。'));
-    }, 100);
+    }, 350);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
   }, [state, ready, busy, saveRevision]);
   useEffect(() => {
@@ -89,11 +99,14 @@ function useAppController() {
     ] }));
   }
 
-  function selectConversation(id: string) { update(s => ({ ...s, activeConversationId: id })); }
+  function selectConversation(id: string) {
+    update(s => s.activeConversationId === id || !s.conversations.some(c => c.id === id)
+      ? s : { ...s, activeConversationId: id });
+  }
   function renameConversation(id: string, title: string) {
     const value = title.trim().slice(0, 80);
     if (!value) return;
-    update(s => ({ ...s, conversations: s.conversations.map(c => c.id === id ? { ...c, title: value } : c) }));
+    update(s => ({ ...s, conversations: s.conversations.map(c => c.id === id && c.title !== value ? { ...c, title: value } : c) }));
   }
   function removeConversation(id: string) {
     if (activeRequest.current) return;
@@ -103,7 +116,8 @@ function useAppController() {
     });
   }
   function changeSettings(settings: Partial<Settings>) {
-    update(s => ({ ...s, settings: { ...s.settings, ...settings } }));
+    update(s => Object.entries(settings).every(([key, value]) => s.settings[key as keyof Settings] === value)
+      ? s : { ...s, settings: { ...s.settings, ...settings } });
   }
 
   async function connect(key: string) {
@@ -171,30 +185,45 @@ function useAppController() {
     activeRequest.current = controller;
     setBusy(true); setNotice('');
     function patchMessage(patch: (m: Message) => Message) {
-      update(s => ({ ...s, conversations: s.conversations.map(c => c.id === conversationId ? {
-        ...c, updatedAt: Date.now(), messages: c.messages.map(m => m.id === assistantId ? patch(m) : m),
-      } : c) }));
+      update(s => ({ ...s, conversations: s.conversations.map(c => {
+        if (c.id !== conversationId) return c;
+        const index = c.messages.at(-1)?.id === assistantId ? c.messages.length - 1
+          : c.messages.findIndex(m => m.id === assistantId);
+        if (index < 0) return c;
+        const messages = c.messages.slice();
+        messages[index] = patch(messages[index]);
+        return { ...c, updatedAt: Date.now(), messages };
+      }) }));
     }
     let refused = false;
+    const output = createStreamBuffer(delta => {
+      if (delta.refused) {
+        refused = true;
+        patchMessage(m => ({ ...m, content: '这次内容未通过服务方安全检查。可以换个话题继续聊。', reasoning: '', status: 'refused', contextEligible: false }));
+      } else if (!refused) {
+        patchMessage(m => ({ ...m, content: m.content + (delta.content ?? ''), reasoning: (m.reasoning ?? '') + (delta.reasoning ?? '') }));
+      }
+    });
     try {
       // Persist the question before making a potentially billable request.
+      await yieldToUi();
       await saveState(current.current);
       const result = await streamChat({ apiKey, messages: requestMessages, settings: current.current.settings,
         signal: controller.signal, fetchImpl: expoFetch,
-        onDelta: delta => {
-          if (delta.refused) { refused = true; patchMessage(m => ({ ...m, content: '这次内容未通过服务方安全检查。可以换个话题继续聊。', reasoning: '', status: 'refused', contextEligible: false })); return; }
-          if (!refused) patchMessage(m => ({ ...m, content: m.content + (delta.content ?? ''), reasoning: (m.reasoning ?? '') + (delta.reasoning ?? '') }));
-        },
+        onDelta: output.push,
       });
+      output.flush();
       if (!refused) patchMessage(m => ({ ...m, status: result.finishReason === 'length' ? 'stopped' : 'complete', contextEligible: result.finishReason !== 'length' }));
       if (result.finishReason === 'length') setNotice('本次回复达到输出上限。你可以另发一条消息继续提问。');
     } catch (error) {
+      output.flush();
       if (!refused) {
         const cancelled = controller.signal.aborted || (error instanceof Error && error.name === 'AbortError');
         patchMessage(m => ({ ...m, status: cancelled ? 'stopped' : 'error', contextEligible: false,
           error: cancelled ? undefined : error instanceof Error ? error.message : '回复中断，请稍后重试。' }));
       }
     } finally {
+      output.dispose();
       activeRequest.current = null; setBusy(false);
       try { await saveState(current.current); setSaveError(''); } catch { setSaveError('记录暂未保存成功，请重试保存。'); }
     }
@@ -238,6 +267,7 @@ function useAppController() {
     if (working || activeRequest.current) return;
     setWorking(true);
     try {
+      await yieldToUi();
       const data = exportHistory(current.current);
       const filename = `shiyu-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
       if (Platform.OS === 'web') {
@@ -258,7 +288,7 @@ function useAppController() {
     finally { setWorking(false); }
   }
   async function clearAll() {
-    if (activeRequest.current || working || accountTask.current) return;
+    if (activeRequest.current || working || accountTask.current || initializing.current) return;
     accountTask.current = true;
     persistenceAllowed.current = false;
     if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -272,11 +302,23 @@ function useAppController() {
     } catch { setLoadError('清除未完成，请重试。'); }
     finally { accountTask.current = false; }
   }
-  return { state, active, ready, loadError, initialize, apiKey, busy, working, notice, setNotice,
-    saveError, retrySave: () => setSaveRevision(v => v + 1), balance, preview, setPreview,
-    newConversation, selectConversation, renameConversation, removeConversation, changeSettings,
-    connect, refreshBalance, forgetKey, send, stop: () => activeRequest.current?.abort(),
-    pickHistory, confirmImport, backup, clearAll };
+  return { state, active, ready, loadError, apiKey, busy, working, notice, setNotice,
+    saveError, retrySave: useCallback(() => setSaveRevision(v => v + 1), []), balance, preview, setPreview,
+    initialize: useLatestCallback(initialize),
+    newConversation: useLatestCallback(newConversation),
+    selectConversation: useLatestCallback(selectConversation),
+    renameConversation: useLatestCallback(renameConversation),
+    removeConversation: useLatestCallback(removeConversation),
+    changeSettings: useLatestCallback(changeSettings),
+    connect: useLatestCallback(connect),
+    refreshBalance: useLatestCallback(refreshBalance),
+    forgetKey: useLatestCallback(forgetKey),
+    send: useLatestCallback(send),
+    stop: useCallback(() => activeRequest.current?.abort(), []),
+    pickHistory: useLatestCallback(pickHistory),
+    confirmImport: useLatestCallback(confirmImport),
+    backup: useLatestCallback(backup),
+    clearAll: useLatestCallback(clearAll) };
 }
 
 type Controller = ReturnType<typeof useAppController>;

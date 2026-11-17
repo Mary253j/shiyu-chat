@@ -5,12 +5,9 @@ import { AppState, emptyState } from '../core/types';
 let previewState: AppState = emptyState();
 let previewKey = '';
 
-function clone<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
-}
-
-export async function loadState(): Promise<AppState> { return clone(previewState); }
-export async function saveState(state: AppState): Promise<void> { previewState = clone(state); }
+// AppProvider uses immutable updates, so retaining its snapshot does not need a full JSON clone.
+export async function loadState(): Promise<AppState> { return previewState; }
+export async function saveState(state: AppState): Promise<void> { previewState = state; }
 export async function loadApiKey(): Promise<string> { return previewKey; }
 export async function saveApiKey(apiKey: string): Promise<void> { previewKey = apiKey.trim(); }
 export async function deleteAllLocalData(): Promise<void> {

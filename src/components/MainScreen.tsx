@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { memo, useCallback, useDeferredValue, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator, FlatList, KeyboardAvoidingView, Linking, Modal, Platform, Pressable,
   ScrollView, StyleSheet, Switch, Text, TextInput, useWindowDimensions, View,
@@ -7,15 +7,16 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import Feather from '@expo/vector-icons/Feather';
 import { router } from 'expo-router';
 import * as Clipboard from 'expo-clipboard';
-import Markdown from 'react-native-markdown-display';
 import { useChatApp } from '../services/AppProvider';
 import { Conversation, Message } from '../core/types';
 import SupportPanel from './SupportPanel';
+import ChatMessages from './ChatMessages';
 
 type Page = 'chat' | 'library' | 'settings' | 'support';
 type IconName = React.ComponentProps<typeof Feather>['name'];
 const colors = { bg: '#FAF9F6', paper: '#FFFFFF', ink: '#253C36', muted: '#738079', green: '#315C4C', pale: '#EDF3EE', line: '#E5E9E2', warm: '#F3EBDD' };
 const routes = { chat: '/', library: '/library', settings: '/settings', support: '/support' } as const;
+const emptyMessages: Message[] = [];
 const nav: { page: Page; label: string; icon: IconName }[] = [
   { page: 'chat', label: '聊一会儿', icon: 'message-circle' },
   { page: 'library', label: '我的对话', icon: 'book-open' },
@@ -52,18 +53,58 @@ export default function MainScreen({ page = 'chat' }: { page?: Page }) {
   const [newTitle, setNewTitle] = useState('');
   const [confirm, setConfirm] = useState<{ title: string; description: string; action: () => void | Promise<void>; destructive?: boolean } | null>(null);
   const [privacy, setPrivacy] = useState(false);
-  const list = useRef<FlatList<Message>>(null);
-  const messages = app.active?.messages ?? [];
-  const conversations = [...app.state.conversations].sort((a, b) => b.updatedAt - a.updatedAt);
-  const filtered = conversations.filter(c => c.title.toLowerCase().includes(query.toLowerCase()) || c.messages.some(m => m.content.toLowerCase().includes(query.toLowerCase())));
+  const [followRequest, setFollowRequest] = useState(0);
+  const actions = useRef(app);
+  useLayoutEffect(() => { actions.current = app; });
+  const messages = app.active?.messages ?? emptyMessages;
+  // Typing a draft must not sort/search every imported conversation. On phones,
+  // the chat screen does not need a conversation index at all.
+  const conversations = useMemo(() => page === 'library' || wide
+    ? [...app.state.conversations].sort((a, b) => b.updatedAt - a.updatedAt)
+    : app.state.conversations, [app.state.conversations, page, wide]);
+  const searchQuery = useDeferredValue(query.trim().toLowerCase());
+  const filtered = useMemo(() => {
+    if (page !== 'library') return [];
+    if (!searchQuery) return conversations;
+    return conversations.filter(c => c.title.toLowerCase().includes(searchQuery)
+      || c.messages.some(m => m.content.toLowerCase().includes(searchQuery)));
+  }, [conversations, page, searchQuery]);
+
+  const openConversation = useCallback((conversation: Conversation) => {
+    actions.current.selectConversation(conversation.id);
+    router.replace('/');
+  }, []);
+  const beginRename = useCallback((conversation: Conversation) => {
+    setRename(conversation); setNewTitle(conversation.title);
+  }, []);
+  const beginRemove = useCallback((conversation: Conversation) => {
+    setConfirm({ title: '删除这段对话？', description: '仅从本机对话列表删除。此操作无法撤销。', destructive: true,
+      action: () => actions.current.removeConversation(conversation.id) });
+  }, []);
+  const onCopyMessage = useCallback((content: string) => {
+    void Clipboard.setStringAsync(content).then(() => actions.current.setNotice('已复制到剪贴板。'))
+      .catch(() => actions.current.setNotice('复制未完成，请重试。'));
+  }, []);
+  const onMessageLink = useCallback((url: string) => {
+    setConfirm({ title: '打开外部网页？', description: url, action: async () => {
+      if (!/^https:\/\//i.test(url)) return;
+      try { await Linking.openURL(url); } catch { actions.current.setNotice('暂时无法打开链接，请稍后再试。'); }
+    } });
+  }, []);
+  const onRetryMessage = useCallback((content: string) => {
+    setFollowRequest(value => value + 1);
+    void actions.current.send(content, true);
+  }, []);
+  const renderConversation = useCallback(({ item }: { item: Conversation }) => (
+    <ConversationRow conversation={item} busy={app.busy} onOpen={openConversation} onRename={beginRename} onRemove={beginRemove} />
+  ), [app.busy, openConversation, beginRename, beginRemove]);
 
   function go(destination: Page) { router.replace(routes[destination]); }
   function start() { app.newConversation(); go('chat'); }
-  function openConversation(c: Conversation) { app.selectConversation(c.id); go('chat'); }
   function send() {
     if (!app.apiKey) { app.setNotice('先连接自己的 DeepSeek 账户，就可以继续聊。'); go('settings'); return; }
     if (!draft.trim()) return;
-    const value = draft; setDraft(''); void app.send(value);
+    const value = draft; setDraft(''); setFollowRequest(value => value + 1); void app.send(value);
   }
   function backup() {
     setConfirm({ title: '导出聊天备份', description: '导出文件包含明文聊天和导入原始记录，不会加入设置中保存的 API Key。请保存到可信的位置，不要公开分享。', action: app.backup });
@@ -104,12 +145,8 @@ export default function MainScreen({ page = 'chat' }: { page?: Page }) {
         {!!app.saveError && <Pressable onPress={app.retrySave} style={s.errorBanner}><Text style={s.errorText}>{app.saveError} 点击重试</Text></Pressable>}
 
         {page === 'chat' && <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-          {messages.length ? <FlatList ref={list} data={messages} keyExtractor={m => m.id} style={{ flex: 1 }} contentContainerStyle={[s.messages, { paddingHorizontal: wide ? 36 : 18 }]}
-            onContentSizeChange={() => { if (app.busy) list.current?.scrollToEnd({ animated: false }); }}
-            ListFooterComponent={<View style={{ height: 15 }} />}
-            renderItem={({ item, index }) => <MessageBubble message={item} onCopy={() => { void Clipboard.setStringAsync(item.content); app.setNotice('已复制到剪贴板。'); }}
-              onLink={url => setConfirm({ title: '打开外部网页？', description: url, action: () => openLink(url) })}
-              onRetry={index === messages.length - 1 && !app.busy && ['error', 'stopped'].includes(item.status) && messages[index - 1]?.role === 'user' ? () => void app.send(messages[index - 1].content, true) : undefined} />}
+          {messages.length ? <ChatMessages key={app.active?.id} messages={messages} busy={app.busy} wide={wide}
+            followRequest={followRequest} onCopy={onCopyMessage} onLink={onMessageLink} onRetry={onRetryMessage}
           /> : <ScrollView contentContainerStyle={s.welcomeScroll}>
             <View style={s.welcome}>
               <View style={s.welcomeIcon}><Icon name="feather" size={34} /></View>
@@ -136,15 +173,18 @@ export default function MainScreen({ page = 'chat' }: { page?: Page }) {
           </View>
         </KeyboardAvoidingView>}
 
-        {page === 'library' && <ScrollView contentContainerStyle={s.pageContent}>
-          <View style={s.pageLead}><Text style={s.pageTitle}>每一段，都好好留着。</Text><Text style={s.body}>记录保存在本机。导入会合并已有对话，不会覆盖。</Text></View>
-          <View style={s.rowWrap}><Button text={app.working ? '正在读取…' : '导入旧对话'} icon="download" onPress={() => void app.pickHistory()} disabled={app.working || app.busy} /><Button text="导出备份" icon="upload" secondary onPress={backup} disabled={app.working || app.busy || !conversations.length} /></View>
-          <View style={s.search}><Icon name="search" color={colors.muted} size={18} /><TextInput value={query} onChangeText={setQuery} placeholder="搜索标题或聊天内容" accessibilityLabel="搜索对话" style={s.searchInput} /></View>
-          <Text style={s.overline}>{filtered.length} 段对话</Text>
-          {filtered.map(c => <View key={c.id} style={s.conversationRow}><Pressable style={{ flex: 1, gap: 7 }} onPress={() => openConversation(c)}><Text style={s.cardTitle} numberOfLines={1}>{c.title}</Text><Text style={s.small} numberOfLines={1}>{c.messages.filter(m => m.role === 'user').at(-1)?.content ?? '还没写下第一句话'}</Text><Text style={s.tiny}>{new Date(c.updatedAt).toLocaleDateString('zh-CN')} · {c.messages.length} 条消息{c.sourceId ? ' · 导入的对话' : ''}</Text></Pressable><SmallButton icon="edit-2" label={`重命名 ${c.title}`} onPress={() => { setRename(c); setNewTitle(c.title); }} disabled={app.busy} /><SmallButton icon="trash-2" label={`删除 ${c.title}`} onPress={() => setConfirm({ title: '删除这段对话？', description: '仅从本机对话列表删除。此操作无法撤销。', destructive: true, action: () => app.removeConversation(c.id) })} disabled={app.busy} /></View>)}
-          {!filtered.length && <View style={s.empty}><Icon name="book-open" size={32} color="#8CA092" /><Text style={s.body}>{query ? '还没有找到这段对话。' : '这里等着收藏你的第一段对话。'}</Text></View>}
-          <View style={s.infoCard}><Icon name="info" size={18} /><Text style={[s.small, { flex: 1 }]}>支持 DeepSeek ZIP 与 JSON，以及拾语备份。第一版恢复文字与思考，附件和联网工具上下文不参与续聊；导入前会显示具体提示。换机或卸载前，请先导出备份。</Text></View>
-        </ScrollView>}
+        {page === 'library' && <FlatList<Conversation> testID="conversation-list" data={filtered} keyExtractor={conversation => conversation.id}
+          renderItem={renderConversation} extraData={app.busy} style={{ flex: 1 }} contentContainerStyle={s.libraryContent}
+          initialNumToRender={10} maxToRenderPerBatch={8} windowSize={7} updateCellsBatchingPeriod={50} keyboardShouldPersistTaps="handled"
+          ListHeaderComponent={<View style={s.libraryHeader}>
+            <View style={s.pageLead}><Text style={s.pageTitle}>每一段，都好好留着。</Text><Text style={s.body}>记录保存在本机。导入会合并已有对话，不会覆盖。</Text></View>
+            <View style={s.rowWrap}><Button text={app.working ? '正在读取…' : '导入旧对话'} icon="download" onPress={() => void app.pickHistory()} disabled={app.working || app.busy} /><Button text="导出备份" icon="upload" secondary onPress={backup} disabled={app.working || app.busy || !conversations.length} /></View>
+            <View style={s.search}><Icon name="search" color={colors.muted} size={18} /><TextInput value={query} onChangeText={setQuery} placeholder="搜索标题或聊天内容" accessibilityLabel="搜索对话" style={s.searchInput} /></View>
+            <Text style={s.overline}>{filtered.length} 段对话</Text>
+          </View>}
+          ListEmptyComponent={<View style={s.empty}><Icon name="book-open" size={32} color="#8CA092" /><Text style={s.body}>{query ? '还没有找到这段对话。' : '这里等着收藏你的第一段对话。'}</Text></View>}
+          ListFooterComponent={<View style={s.infoCard}><Icon name="info" size={18} /><Text style={[s.small, { flex: 1 }]}>支持 DeepSeek ZIP 与 JSON，以及拾语备份。第一版恢复文字与思考，附件和联网工具上下文不参与续聊；导入前会显示具体提示。换机或卸载前，请先导出备份。</Text></View>}
+        />}
 
         {page === 'settings' && <ScrollView contentContainerStyle={s.pageContent} keyboardShouldPersistTaps="handled">
           <View style={s.pageLead}><Text style={s.pageTitle}>简单设置，安心开始。</Text><Text style={s.body}>使用你自己的 DeepSeek 账户。我们不代收 API 费用。</Text></View>
@@ -177,20 +217,27 @@ export default function MainScreen({ page = 'chat' }: { page?: Page }) {
   </SafeAreaView>;
 }
 
-function MessageBubble({ message, onCopy, onRetry, onLink }: { message: Message; onCopy: () => void; onRetry?: () => void; onLink: (url: string) => void }) {
-  const [expanded, setExpanded] = useState(false);
-  const isUser = message.role === 'user';
-  return <View style={[s.messageRow, isUser && { alignItems: 'flex-end' }]}>
-    {!isUser && <View style={s.assistantLabel}><View style={s.smallMark}><Icon name="feather" size={14} color="#fff" /></View><Text style={s.small}>DeepSeek</Text><Text style={s.tiny}>· AI 生成</Text></View>}
-    <View style={[s.bubble, isUser && s.userBubble]}>
-      {!!message.reasoning && !isUser && <View style={s.reasoning}><Pressable onPress={() => setExpanded(!expanded)} style={s.reasoningToggle}><Icon name="aperture" size={14} /><Text style={s.small}>{message.status === 'streaming' && !message.content ? '正在思考…' : '思考过程'}</Text><Icon name={expanded ? 'chevron-up' : 'chevron-down'} size={14} /></Pressable>{expanded && <Text selectable style={s.reasoningText}>{message.reasoning}</Text>}</View>}
-      {isUser ? <Text selectable style={s.messageText}>{message.content}</Text> : message.content ? <Markdown style={markdownStyles} onLinkPress={url => { if (/^https:\/\//i.test(url)) onLink(url); return false; }} rules={{ image: () => null }}>{message.content}</Markdown> : message.status === 'streaming' ? <View style={s.typing}><ActivityIndicator size="small" color={colors.green} /><Text style={s.small}>在认真听你说…</Text></View> : <Text style={s.small}>{message.status === 'stopped' ? '已停止生成' : '暂时没有收到回复'}</Text>}
-      {!!message.error && <Text style={s.errorText}>{message.error}</Text>}
-      {message.status === 'stopped' && !!message.content && <Text style={s.tiny}>回复已停止 · 这段未完成的回复不会带入后续上下文</Text>}
-    </View>
-    {!isUser && message.status !== 'streaming' && <View style={s.messageActions}>{!!message.content && <SmallButton icon="copy" label="复制回复" onPress={onCopy} />}{onRetry && <Pressable onPress={onRetry} style={s.retry}><Icon name="rotate-cw" size={14} /><Text style={s.tiny}>重新生成（将消耗 API）</Text></Pressable>}</View>}
-  </View>;
+function lastUserPreview(messages: Message[]): string {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index].role === 'user') return messages[index].content.slice(0, 160);
+  }
+  return '还没写下第一句话';
 }
+
+const ConversationRow = memo(function ConversationRow({ conversation, busy, onOpen, onRename, onRemove }: {
+  conversation: Conversation; busy: boolean; onOpen: (conversation: Conversation) => void;
+  onRename: (conversation: Conversation) => void; onRemove: (conversation: Conversation) => void;
+}) {
+  const preview = lastUserPreview(conversation.messages);
+  return <View testID={`conversation-${conversation.id}`} style={s.conversationRow}>
+    <Pressable accessibilityRole="button" accessibilityLabel={`打开对话 ${conversation.title}`} style={s.conversationSummary} onPress={() => onOpen(conversation)}>
+      <Text style={s.cardTitle} numberOfLines={1}>{conversation.title}</Text><Text style={s.small} numberOfLines={1}>{preview}</Text>
+      <Text style={s.tiny}>{new Date(conversation.updatedAt).toLocaleDateString('zh-CN')} · {conversation.messages.length} 条消息{conversation.sourceId ? ' · 导入的对话' : ''}</Text>
+    </Pressable>
+    <SmallButton icon="edit-2" label={`重命名 ${conversation.title}`} onPress={() => onRename(conversation)} disabled={busy} />
+    <SmallButton icon="trash-2" label={`删除 ${conversation.title}`} onPress={() => onRemove(conversation)} disabled={busy} />
+  </View>;
+});
 
 function Confirmation({ value, onClose }: { value: { title: string; description: string; action: () => void | Promise<void>; destructive?: boolean } | null; onClose: () => void }) {
   const [running, setRunning] = useState(false);
@@ -202,7 +249,6 @@ function Confirmation({ value, onClose }: { value: { title: string; description:
   }} /></View></View></View></Modal>;
 }
 
-const markdownStyles = StyleSheet.create({ body: { fontSize: 16, color: colors.ink, lineHeight: 27 }, paragraph: { marginTop: 0, marginBottom: 10 }, code_inline: { backgroundColor: '#EDF0EB', color: colors.ink }, fence: { backgroundColor: '#EFF2EC', borderColor: colors.line, color: colors.ink, borderRadius: 8, padding: 12 }, link: { color: colors.green }, heading1: { fontSize: 23, lineHeight: 32 }, heading2: { fontSize: 20, lineHeight: 29 }, table: { borderColor: colors.line }, tr: { borderColor: colors.line } });
 const s = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg }, center: { justifyContent: 'center', alignItems: 'center' }, appRow: { flex: 1, flexDirection: 'row' }, main: { flex: 1, minWidth: 0 },
   sidebar: { width: 270, backgroundColor: '#F1F3EC', borderRightWidth: 1, borderRightColor: colors.line, padding: 23, gap: 22 },
@@ -214,7 +260,7 @@ const s = StyleSheet.create({
   header: { minHeight: 80, paddingHorizontal: 36, borderBottomWidth: 1, borderBottomColor: colors.line, flexDirection: 'row', alignItems: 'center', gap: 16 }, headerTitle: { color: colors.ink, fontSize: 17, fontWeight: '600', marginBottom: 5 }, connectionBadge: { flexDirection: 'row', gap: 7, alignItems: 'center' }, previewBanner: { paddingVertical: 8, paddingHorizontal: 20, backgroundColor: '#F3EFDE' }, notice: { margin: 12, marginBottom: 0, paddingLeft: 15, borderRadius: 12, backgroundColor: colors.pale, flexDirection: 'row', alignItems: 'center' }, errorBanner: { backgroundColor: '#F9EAE4', padding: 12 },
   welcomeScroll: { flexGrow: 1, justifyContent: 'center', padding: 22 }, welcome: { width: '100%', maxWidth: 580, alignSelf: 'center', alignItems: 'center', paddingVertical: 20 }, welcomeIcon: { height: 72, width: 72, borderRadius: 26, backgroundColor: '#E8EFE4', alignItems: 'center', justifyContent: 'center', marginBottom: 25, transform: [{ rotate: '-8deg' }] }, welcomeKicker: { color: '#87917F', fontSize: 12, letterSpacing: 3, marginBottom: 14 }, hero: { fontSize: 40, fontWeight: '600', color: colors.ink, letterSpacing: 1 }, welcomeBody: { fontSize: 14, color: colors.muted, lineHeight: 25, textAlign: 'center', marginTop: 17 }, welcomeCards: { flexDirection: 'row', gap: 14, marginTop: 36, width: '100%' }, welcomeCard: { flex: 1, backgroundColor: '#fff', borderColor: colors.line, borderWidth: 1, borderRadius: 19, padding: 19, gap: 12 }, cardIcon: { width: 40, height: 40, backgroundColor: colors.pale, borderRadius: 12, alignItems: 'center', justifyContent: 'center' }, cardTitle: { fontSize: 15, fontWeight: '600', color: colors.ink }, cardArrow: { fontSize: 12, color: colors.green, marginTop: 5 }, privacyNote: { flexDirection: 'row', gap: 7, marginTop: 25, alignItems: 'center' },
   composerArea: { paddingTop: 12, paddingBottom: 12, backgroundColor: colors.bg }, composer: { maxWidth: 820, width: '100%', alignSelf: 'center', backgroundColor: '#fff', borderWidth: 1, borderColor: '#DDE4DA', borderRadius: 21, padding: 15, boxShadow: '0 3px 16px rgba(38,65,45,0.03)' }, composerInput: { fontSize: 15, lineHeight: 24, color: colors.ink, minHeight: 47, maxHeight: 160, padding: 0, textAlignVertical: 'top' }, composerBottom: { flexDirection: 'row', alignItems: 'center', marginTop: 7 }, thinkChip: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 9, borderWidth: 1, borderColor: colors.line }, thinkActive: { backgroundColor: '#E6EFE3', borderColor: '#B2C9AF' }, chipText: { color: colors.green, fontSize: 12 }, sendButton: { height: 37, width: 37, backgroundColor: colors.green, borderRadius: 12, alignItems: 'center', justifyContent: 'center' }, composerFootnote: { textAlign: 'center', fontSize: 10, lineHeight: 16, color: '#969C91', marginTop: 10 },
-  messages: { paddingVertical: 26, maxWidth: 920, alignSelf: 'center', width: '100%' }, messageRow: { marginBottom: 25, alignItems: 'flex-start' }, assistantLabel: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }, smallMark: { width: 26, height: 26, borderRadius: 9, backgroundColor: colors.green, justifyContent: 'center', alignItems: 'center' }, bubble: { maxWidth: '100%', width: '100%' }, userBubble: { backgroundColor: '#EAF0E6', width: 'auto', maxWidth: '88%', borderRadius: 18, borderTopRightRadius: 5, paddingVertical: 12, paddingHorizontal: 17 }, messageText: { fontSize: 16, lineHeight: 27, color: colors.ink }, reasoning: { backgroundColor: '#F0F2EC', borderRadius: 10, padding: 10, marginBottom: 12 }, reasoningToggle: { flexDirection: 'row', gap: 9, alignItems: 'center' }, reasoningText: { color: '#738076', fontSize: 13, lineHeight: 23, marginTop: 10 }, typing: { flexDirection: 'row', gap: 10, alignItems: 'center', paddingVertical: 10 }, messageActions: { flexDirection: 'row', alignItems: 'center' }, retry: { flexDirection: 'row', gap: 6, alignItems: 'center', padding: 9 },
-  pageContent: { padding: 24, paddingBottom: 50, gap: 22, width: '100%', maxWidth: 800, alignSelf: 'center' }, pageLead: { marginTop: 15, marginBottom: 6, gap: 12 }, pageTitle: { fontSize: 26, lineHeight: 37, fontWeight: '600', color: colors.ink }, body: { fontSize: 14, lineHeight: 25, color: colors.muted }, small: { fontSize: 12, lineHeight: 21, color: colors.muted }, tiny: { fontSize: 10, lineHeight: 17, color: colors.muted }, muted: { fontSize: 12, lineHeight: 23, color: colors.muted }, rowWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 }, sectionTitle: { fontSize: 18, fontWeight: '600', color: colors.ink, lineHeight: 28 }, card: { backgroundColor: '#fff', borderWidth: 1, borderColor: colors.line, padding: 23, borderRadius: 19, gap: 17 }, cardHeading: { flexDirection: 'row', gap: 12, alignItems: 'center' }, steps: { backgroundColor: colors.bg, borderRadius: 12, padding: 14, gap: 7 }, textLink: { flexDirection: 'row', gap: 8, alignItems: 'center' }, linkText: { color: colors.green, fontSize: 13, fontWeight: '600' }, keyField: { flexDirection: 'row', borderWidth: 1, borderColor: '#DDE4DA', borderRadius: 11, alignItems: 'center' }, keyInput: { flex: 1, padding: 13, fontSize: 14, color: colors.ink, minWidth: 0 }, balanceRow: { borderTopWidth: 1, borderTopColor: colors.line, paddingTop: 17, flexDirection: 'row', gap: 10, alignItems: 'center', justifyContent: 'space-between' }, balance: { fontSize: 22, lineHeight: 34, color: colors.green, fontWeight: '600' }, settingRow: { flexDirection: 'row', gap: 12, alignItems: 'center' }, choice: { borderWidth: 1, borderColor: colors.line, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10 }, choiceSelected: { backgroundColor: colors.pale, borderColor: '#9FB69E' }, aboutCard: { gap: 16, alignItems: 'flex-start', padding: 8 }, search: { flexDirection: 'row', alignItems: 'center', gap: 10, borderWidth: 1, borderColor: colors.line, borderRadius: 12, backgroundColor: '#fff', paddingHorizontal: 14 }, searchInput: { flex: 1, paddingVertical: 14, color: colors.ink, fontSize: 14 }, conversationRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', borderWidth: 1, borderColor: colors.line, borderRadius: 15, padding: 16 }, empty: { paddingVertical: 45, alignItems: 'center', gap: 18 }, infoCard: { flexDirection: 'row', gap: 12, padding: 16, backgroundColor: colors.pale, borderRadius: 13 },
+  libraryContent: { padding: 24, paddingBottom: 50, width: '100%', maxWidth: 800, alignSelf: 'center' }, libraryHeader: { gap: 22, marginBottom: 22 }, conversationSummary: { flex: 1, gap: 7 },
+  pageContent: { padding: 24, paddingBottom: 50, gap: 22, width: '100%', maxWidth: 800, alignSelf: 'center' }, pageLead: { marginTop: 15, marginBottom: 6, gap: 12 }, pageTitle: { fontSize: 26, lineHeight: 37, fontWeight: '600', color: colors.ink }, body: { fontSize: 14, lineHeight: 25, color: colors.muted }, small: { fontSize: 12, lineHeight: 21, color: colors.muted }, tiny: { fontSize: 10, lineHeight: 17, color: colors.muted }, muted: { fontSize: 12, lineHeight: 23, color: colors.muted }, rowWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 }, sectionTitle: { fontSize: 18, fontWeight: '600', color: colors.ink, lineHeight: 28 }, card: { backgroundColor: '#fff', borderWidth: 1, borderColor: colors.line, padding: 23, borderRadius: 19, gap: 17 }, cardHeading: { flexDirection: 'row', gap: 12, alignItems: 'center' }, steps: { backgroundColor: colors.bg, borderRadius: 12, padding: 14, gap: 7 }, textLink: { flexDirection: 'row', gap: 8, alignItems: 'center' }, linkText: { color: colors.green, fontSize: 13, fontWeight: '600' }, keyField: { flexDirection: 'row', borderWidth: 1, borderColor: '#DDE4DA', borderRadius: 11, alignItems: 'center' }, keyInput: { flex: 1, padding: 13, fontSize: 14, color: colors.ink, minWidth: 0 }, balanceRow: { borderTopWidth: 1, borderTopColor: colors.line, paddingTop: 17, flexDirection: 'row', gap: 10, alignItems: 'center', justifyContent: 'space-between' }, balance: { fontSize: 22, lineHeight: 34, color: colors.green, fontWeight: '600' }, settingRow: { flexDirection: 'row', gap: 12, alignItems: 'center' }, choice: { borderWidth: 1, borderColor: colors.line, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10 }, choiceSelected: { backgroundColor: colors.pale, borderColor: '#9FB69E' }, aboutCard: { gap: 16, alignItems: 'flex-start', padding: 8 }, search: { flexDirection: 'row', alignItems: 'center', gap: 10, borderWidth: 1, borderColor: colors.line, borderRadius: 12, backgroundColor: '#fff', paddingHorizontal: 14 }, searchInput: { flex: 1, paddingVertical: 14, color: colors.ink, fontSize: 14 }, conversationRow: { marginBottom: 16, flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', borderWidth: 1, borderColor: colors.line, borderRadius: 15, padding: 16 }, empty: { paddingVertical: 45, alignItems: 'center', gap: 18 }, infoCard: { flexDirection: 'row', gap: 12, padding: 16, backgroundColor: colors.pale, borderRadius: 13 },
   bottomNav: { flexDirection: 'row', backgroundColor: '#fff', borderTopWidth: 1, borderColor: colors.line, paddingTop: 10, paddingBottom: 7 }, bottomNavItem: { flex: 1, alignItems: 'center', gap: 5, padding: 5 }, bottomLabel: { fontSize: 10, color: '#99A29B' }, overlay: { flex: 1, backgroundColor: 'rgba(23,39,30,0.35)', alignItems: 'center', justifyContent: 'center', padding: 24 }, dialog: { backgroundColor: colors.bg, borderRadius: 23, padding: 25, width: '100%', maxWidth: 500, gap: 19 }, dialogInput: { backgroundColor: '#fff', borderColor: colors.line, borderWidth: 1, padding: 13, borderRadius: 10, color: colors.ink }, errorText: { color: '#A45A44', fontSize: 13, lineHeight: 23 }, warningText: { color: '#8A7250', fontSize: 12, lineHeight: 23, marginBottom: 6 },
 });
