@@ -4,8 +4,9 @@ import {
   type ListRenderItemInfo, type NativeScrollEvent, type NativeSyntheticEvent,
 } from 'react-native';
 import Feather from '@expo/vector-icons/Feather';
-import Markdown from 'react-native-markdown-display';
+import Markdown, { MarkdownIt } from 'react-native-markdown-display';
 import type { Message } from '../core/types';
+import { zeroWidthHspacePlugin } from '../core/markdown-spacing';
 
 const colors = { ink: '#253C36', muted: '#738079', green: '#315C4C', line: '#E5E9E2' };
 const getItem = (messages: Message[], index: number): Message => messages[messages.length - 1 - index];
@@ -13,6 +14,9 @@ const getItemCount = (messages: Message[]): number => messages.length;
 const keyExtractor = (message: Message): string => message.id;
 const maintainPosition = { minIndexForVisible: 0 };
 const markdownRules = { image: () => null };
+// Interpret supported spacing only while rendering. Stored messages, copied
+// source, exported backups and request context keep their original text.
+const chatMarkdown = MarkdownIt({ typographer: true }).use(zeroWidthHspacePlugin);
 const LATEST_THRESHOLD = 72;
 
 interface Props {
@@ -189,7 +193,7 @@ const MarkdownContent = memo(function MarkdownContent({ content, onLink }: { con
     if (/^https:\/\//i.test(url)) onLink(url);
     return false;
   }, [onLink]);
-  return <Markdown style={markdownStyles} onLinkPress={onLinkPress} rules={markdownRules}>{content}</Markdown>;
+  return <Markdown style={markdownStyles} onLinkPress={onLinkPress} rules={markdownRules} markdownit={chatMarkdown}>{content}</Markdown>;
 });
 
 const MessageBubble = memo(function MessageBubble({ message, onCopy, onLink, onRetry, retryText, actionsDisabled, selectionMode, selected, onToggleSelection, onDelete }: {
