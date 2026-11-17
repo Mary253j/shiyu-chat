@@ -1,12 +1,13 @@
 import { Inflate, strFromU8, strToU8 } from 'fflate';
-import type { AppState, Conversation, Message, MessageStatus } from './types';
+import type { AppState, ContextUsage, Conversation, Message, MessageStatus } from './types';
+import { parseMessageAttachments } from './attachments';
 
 /**
  * Independent reader of DeepSeek's documented v3 archive format.
  * Format reference (MIT, Copyright 2026 DeepSeek):
  * https://github.com/deepseek-ai/chat-demo/tree/main/src/services/chat/history
  * No upstream implementation is copied here. Keep the complete source session
- * in originalData: this text-only app cannot replay attachments or tool blocks.
+ * in originalData: this importer cannot restore ZIP attachment bytes or tool blocks.
  */
 export interface ImportPreview {
   conversations: Conversation[];
@@ -396,6 +397,20 @@ function importedConversation(value: unknown, official: boolean, budget: Budget)
   };
 }
 
+function backupContextUsage(value: unknown): ContextUsage {
+  const item = row(value, '上下文用量');
+  for (const key of ['includedHistoryMessages', 'eligibleHistoryMessages', 'omittedHistoryMessages']) {
+    if (!Number.isSafeInteger(item[key]) || Number(item[key]) < 0) fail('备份上下文用量无效。');
+  }
+  if (typeof item.truncated !== 'boolean'
+    || Number(item.includedHistoryMessages) + Number(item.omittedHistoryMessages) !== item.eligibleHistoryMessages
+    || (item.reason !== undefined && (typeof item.reason !== 'string' || item.reason.length > 1000))) fail('备份上下文用量无效。');
+  return { includedHistoryMessages: item.includedHistoryMessages as number,
+    eligibleHistoryMessages: item.eligibleHistoryMessages as number,
+    omittedHistoryMessages: item.omittedHistoryMessages as number, truncated: item.truncated,
+    ...(item.reason === undefined ? {} : { reason: item.reason as string }) };
+}
+
 function backupConversation(value: unknown, budget: Budget): Conversation {
   const raw = row(value, '备份会话'); const id = idValue(raw.id, '备份会话 ID');
   const createdAt = raw.createdAt; const updatedAt = raw.updatedAt;
@@ -409,10 +424,18 @@ function backupConversation(value: unknown, budget: Budget): Conversation {
     if (typeof item.createdAt !== 'number' || !Number.isFinite(item.createdAt) || item.createdAt < 0) fail('备份消息时间无效。');
     if (item.contextEligible !== undefined && typeof item.contextEligible !== 'boolean') fail('备份上下文标识无效。');
     const status = messageStatus(item.status, true);
+    let attachments: Message['attachments'];
+    if (item.attachments !== undefined) {
+      if (item.role !== 'user') fail('只有用户消息可以包含附件。');
+      try { attachments = parseMessageAttachments(item.attachments); }
+      catch { fail('备份附件信息无效，未导入任何会话。'); }
+    }
     return {
       id: messageId, role: item.role, content: textValue(item.content, '备份正文'), createdAt: item.createdAt, status,
       ...(item.reasoning === undefined ? {} : { reasoning: textValue(item.reasoning, '备份思考') }),
       ...(item.error === undefined ? {} : { error: textValue(item.error, '备份错误提示') }),
+      ...(attachments === undefined ? {} : { attachments }),
+      ...(item.contextUsage === undefined ? {} : { contextUsage: backupContextUsage(item.contextUsage) }),
       contextEligible: status !== 'error' && status !== 'refused' && item.contextEligible !== false,
     };
   });
@@ -490,6 +513,9 @@ export function parseHistory(input: string | Uint8Array, filename: string): Impo
     if (seen.has(key) || localIds.has(conversation.id)) fail('文件中存在重复的来源会话或本地 ID，未导入任何会话。');
     seen.add(key); localIds.add(conversation.id);
     for (const warning of conversation.importWarnings ?? []) warnings.add(warning);
+    if (conversation.messages.some(message => message.attachments?.length)) {
+      warnings.add('附件备份只包含 DeepSeek 账户中的文件引用，不含原件；换账户、远端删除或过期后需重新选择原文件。');
+    }
   }
   return { conversations, warnings: [...warnings], messageCount: conversations.reduce((sum, item) => sum + item.messages.length, 0), sourceLabel };
 }
@@ -513,11 +539,17 @@ export function mergeConversations(existing: Conversation[], incoming: Conversat
 export function exportHistory(state: AppState): string {
   const result = JSON.stringify({
     schemaVersion: 1,
-    conversations: state.conversations,
+    conversations: state.conversations.map(conversation => ({ ...conversation,
+      messages: conversation.messages.map(message => ({ ...message,
+        ...(message.attachments === undefined ? {} : { attachments: parseMessageAttachments(message.attachments) }),
+        ...(message.contextUsage === undefined ? {} : { contextUsage: backupContextUsage(message.contextUsage) }),
+      })),
+    })),
     activeConversationId: state.activeConversationId,
     settings: {
       model: state.settings.model, thinking: state.settings.thinking,
       contextMessageLimit: state.settings.contextMessageLimit, maxOutputTokens: state.settings.maxOutputTokens,
+      ...(state.settings.contextMode === undefined ? {} : { contextMode: state.settings.contextMode }),
     },
   });
   // Refuse to produce a backup this importer cannot subsequently restore.

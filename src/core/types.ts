@@ -1,4 +1,15 @@
+import type { MessageAttachment } from './attachments';
+export type { MessageAttachment } from './attachments';
+
 export type MessageStatus = 'complete' | 'streaming' | 'stopped' | 'error' | 'refused';
+
+export interface ContextUsage {
+  includedHistoryMessages: number;
+  eligibleHistoryMessages: number;
+  omittedHistoryMessages: number;
+  truncated: boolean;
+  reason?: string;
+}
 
 export interface Message {
   id: string;
@@ -9,6 +20,8 @@ export interface Message {
   status: MessageStatus;
   contextEligible?: boolean;
   error?: string;
+  attachments?: MessageAttachment[];
+  contextUsage?: ContextUsage;
 }
 
 export interface Conversation {
@@ -27,6 +40,7 @@ export interface Settings {
   thinking: boolean;
   contextMessageLimit: number;
   maxOutputTokens: number;
+  contextMode?: 'auto' | 'recent';
 }
 
 export interface AppState {
@@ -38,7 +52,7 @@ export interface AppState {
 
 export const defaultSettings: Settings = {
   model: 'deepseek-flash', thinking: false,
-  contextMessageLimit: 40, maxOutputTokens: 4096,
+  contextMessageLimit: 40, maxOutputTokens: 4096, contextMode: 'auto',
 };
 
 export const emptyState = (): AppState => ({

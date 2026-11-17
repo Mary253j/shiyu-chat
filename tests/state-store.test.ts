@@ -78,6 +78,21 @@ test('switching the active conversation only writes a small manifest', async () 
   assert.equal(h.stats.lists, 0);
 });
 
+test('context mode changes survive a restart without rewriting conversation bodies', async () => {
+  const h = createMemoryIO(); const store = h.makeStore();
+  const state = fixtureState(fixtureConversation('a'));
+  // An older installation has no contextMode field and retains its old limit.
+  delete state.settings.contextMode;
+  await store.saveState(state); h.resetStats();
+  const recent = { ...state, settings: { ...state.settings, contextMode: 'recent' as const } };
+  await store.saveState(recent);
+  assert.equal((await h.makeStore().loadState()).settings.contextMode, 'recent');
+  assert.equal(h.stats.encryptions.length, 1);
+  assert.match(h.stats.encryptions[0].context, /^index:/);
+  await store.saveState({ ...recent, settings: { ...recent.settings, contextMode: 'auto' } });
+  assert.equal((await h.makeStore().loadState()).settings.contextMode, 'auto');
+});
+
 test('editing one conversation does not serialize other conversations or its originalData', async () => {
   const h = createMemoryIO(); const store = h.makeStore();
   let originalReads = 0;

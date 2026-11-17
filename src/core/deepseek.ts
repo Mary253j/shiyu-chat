@@ -1,4 +1,7 @@
 import type { Message, Settings } from './types';
+import { buildContextPlan, resolveMaxOutputTokens } from './context';
+export { buildContextPlan, buildMessages, ContextPlanError } from './context';
+export type { ContextPlan, RequestMessage, RequestFilePart, RequestTextPart } from './context';
 
 const API_ORIGIN = 'https://api.deepseek.com';
 const MAX_EVENT_CHARS = 1_048_576;
@@ -43,7 +46,7 @@ export type DeepSeekErrorCode =
 
 const errorMessages: Record<DeepSeekErrorCode, string> = {
   missing_key: '请先在设置中填写有效的 DeepSeek API Key。',
-  invalid_request: '无法发送这条消息，请检查内容、模型和上下文设置。',
+  invalid_request: '服务方未接受这次请求。请检查消息和模型；如含附件或很长的历史，请减少附件、缩小上下文范围后重试。',
   auth: 'API Key 无效或已失效，请在设置中重新填写。',
   balance: 'DeepSeek API 账户余额不足，请检查官方平台账户。',
   forbidden: '此 API 账户暂时无法访问该服务，请检查账户权限。',
@@ -142,49 +145,6 @@ async function request(
   }
 }
 
-export interface RequestMessage {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-const eligible = (message: Message | undefined): message is Message =>
-  !!message && message.status === 'complete' && message.contextEligible !== false
-  && typeof message.content === 'string' && message.content.trim().length > 0;
-
-/**
- * Keeps whole successful user/assistant pairs plus the current user message.
- * Failed, stopped, refused, and orphaned turns cannot become another turn's context.
- * Imported metadata and reasoning never enter the request, even if present at runtime.
- */
-export function buildMessages(messages: Message[], contextMessageLimit: number): RequestMessage[] {
-  const current = messages[messages.length - 1];
-  if (!eligible(current) || current.role !== 'user') return [];
-
-  const pairs: [RequestMessage, RequestMessage][] = [];
-  let pendingUser: Message | undefined;
-  for (const message of messages.slice(0, -1)) {
-    if (message.role === 'user') {
-      pendingUser = eligible(message) ? message : undefined;
-    } else if (message.role === 'assistant') {
-      if (pendingUser && eligible(message)) {
-        pairs.push([
-          { role: 'user', content: pendingUser.content },
-          { role: 'assistant', content: message.content },
-        ]);
-      }
-      pendingUser = undefined;
-    } else {
-      // A runtime object from an import may not conform to the TypeScript type.
-      pendingUser = undefined;
-    }
-  }
-  const limit = Number.isFinite(contextMessageLimit)
-    ? Math.max(1, Math.min(201, Math.floor(contextMessageLimit))) : 41;
-  const pairCount = Math.floor((limit - 1) / 2);
-  const history = pairCount > 0 ? pairs.slice(-pairCount).flat() : [];
-  return [...history, { role: 'user', content: current.content }];
-}
-
 /** Incremental SSE decoder; CRLF and UTF-8 may both straddle transport chunks. */
 class SSEParser {
   private buffer = '';
@@ -257,10 +217,9 @@ const isRefusal = (value: unknown): boolean =>
 
 export async function streamChat(options: StreamChatOptions): Promise<ChatResult> {
   const { apiKey, messages, settings, signal, onDelta, fetchImpl = globalThis.fetch } = options;
-  const outgoing = buildMessages(messages, settings.contextMessageLimit);
-  if (!outgoing.length) throw new DeepSeekError('invalid_request');
-  const maxTokens = Number.isFinite(settings.maxOutputTokens)
-    ? Math.max(1, Math.min(4096, Math.floor(settings.maxOutputTokens))) : 4096;
+  const plan = buildContextPlan(messages, settings);
+  const outgoing = plan.messages;
+  const maxTokens = resolveMaxOutputTokens(settings.maxOutputTokens);
   const response = await request('/chat/completions', apiKey, {
     method: 'POST',
     signal,

@@ -98,7 +98,7 @@ test('refusal delta is recognized before content in that delta', async () => {
   assert.equal(result.finishReason, 'content_filter');
 });
 
-test('context contains only recent complete pairs and current user, without cross-pairing', () => {
+test('recent context preserves standalone users and complete pairs without cross-pairing', () => {
   const messages: Message[] = [
     message('assistant', 'orphan'),
     message('user', 'old'), message('assistant', 'old reply'),
@@ -112,12 +112,13 @@ test('context contains only recent complete pairs and current user, without cros
     user,
   ];
   assert.deepEqual(buildMessages(messages, 4), [
+    { role: 'user', content: 'no reply' },
     { role: 'user', content: 'recent' },
     { role: 'assistant', content: 'recent reply' },
     { role: 'user', content: '你好' },
   ]);
   assert.deepEqual(buildMessages(messages, 1), [{ role: 'user', content: '你好' }]);
-  assert.deepEqual(buildMessages(messages, 99).map((item) => item.content), ['old', 'old reply', 'recent', 'recent reply', '你好']);
+  assert.deepEqual(buildMessages(messages, 99).map((item) => item.content), ['old', 'old reply', 'no reply', 'recent', 'recent reply', '你好']);
   assert.deepEqual(buildMessages([...messages, message('assistant', 'failed', 'error')], 40), []);
 });
 

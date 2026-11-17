@@ -56,6 +56,7 @@ function assertRecord(value: unknown): asserts value is Record<string, unknown> 
 function assertSettings(value: unknown): asserts value is Settings {
   assertRecord(value);
   if (!['deepseek-flash', 'deepseek-v4-pro'].includes(String(value.model))
+    || (value.contextMode !== undefined && value.contextMode !== 'auto' && value.contextMode !== 'recent')
     || typeof value.thinking !== 'boolean'
     || !Number.isInteger(value.contextMessageLimit) || Number(value.contextMessageLimit) < 1
     || !Number.isInteger(value.maxOutputTokens) || Number(value.maxOutputTokens) < 1) {
@@ -141,6 +142,7 @@ function restoreInterrupted(conversation: Conversation): { conversation: Convers
 
 function equalSettings(a: Settings, b: Settings): boolean {
   return a.model === b.model && a.thinking === b.thinking
+    && (a.contextMode ?? 'auto') === (b.contextMode ?? 'auto')
     && a.contextMessageLimit === b.contextMessageLimit && a.maxOutputTokens === b.maxOutputTokens;
 }
 

@@ -2,13 +2,13 @@
   "expo": {
     "name": "拾语",
     "slug": "shiyu-chat",
-    "version": "0.1.2",
+    "version": "0.1.3",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "android": {
       "package": "com.shiyu.chat",
-      "versionCode": 3,
+      "versionCode": 4,
       "allowBackup": false,
       "permissions": [
         "android.permission.INTERNET"

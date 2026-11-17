@@ -78,7 +78,7 @@ const ChatMessages = memo(function ChatMessages({ messages, busy, wide, followRe
     // RNWeb does not implement native maintainVisibleContentPosition. Only
     // compensate a growing newest row, not measurements of older virtual cells.
     pendingWebAnchor.current = Platform.OS === 'web' && !following.current;
-  }, [latest?.id, latest?.content, latest?.reasoning]);
+  }, [latest?.id, latest?.content, latest?.reasoning, latest?.attachments, latest?.contextUsage]);
 
   const onScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
     const offset = Math.max(0, event.nativeEvent.contentOffset.y);
@@ -162,6 +162,15 @@ const MessageBubble = memo(function MessageBubble({ message, onCopy, onLink, onR
   return <View testID={`chat-message-${message.id}`} style={[styles.messageRow, isUser && styles.userRow]}>
     {!isUser && <View style={styles.assistantLabel}><View style={styles.smallMark}><Feather name="feather" size={14} color="#fff" /></View><Text style={styles.small}>DeepSeek</Text><Text style={styles.tiny}>· AI 生成</Text></View>}
     <View style={[styles.bubble, isUser && styles.userBubble]}>
+      {!!message.attachments?.length && <View style={styles.attachments}>
+        {message.attachments.map(attachment => <View key={attachment.id} testID={`message-attachment-${attachment.id}`} style={styles.attachmentCard}>
+          <Feather name={attachment.kind === 'image' ? 'image' : 'file-text'} size={22} color={colors.green} />
+          <View style={styles.attachmentDescription}><Text style={styles.attachmentName} numberOfLines={2}>{attachment.name}</Text>
+            <Text style={styles.tiny}>{attachment.kind === 'image' ? '图片' : '文件'} · {formatAttachmentSize(attachment.bytes)}</Text>
+            <Text style={styles.tiny}>保存在 DeepSeek 账户</Text>
+          </View>
+        </View>)}
+      </View>}
       {!!message.reasoning && !isUser && <View style={styles.reasoning}>
         <Pressable accessibilityRole="button" accessibilityLabel={expanded ? '收起思考过程' : '展开思考过程'} accessibilityState={{ expanded }} onPress={() => setExpanded(value => !value)} style={styles.reasoningToggle}>
           <Feather name="aperture" size={14} color={colors.green} /><Text style={styles.small}>{message.status === 'streaming' && !message.content ? '正在思考…' : '思考过程'}</Text><Feather name={expanded ? 'chevron-up' : 'chevron-down'} size={14} color={colors.green} />
@@ -174,6 +183,11 @@ const MessageBubble = memo(function MessageBubble({ message, onCopy, onLink, onR
             : <Text style={styles.small}>{message.status === 'stopped' ? '已停止生成' : '暂时没有收到回复'}</Text>}
       {!!message.error && <Text style={styles.errorText}>{message.error}</Text>}
       {message.status === 'stopped' && !!message.content && <Text style={styles.tiny}>回复已停止 · 这段未完成的回复不会带入后续上下文</Text>}
+      {!isUser && message.contextUsage && <View testID={`message-context-${message.id}`} style={styles.contextInfo}>
+        <View style={styles.contextLabel}><Feather name="layers" size={12} color={colors.muted} /><Text style={styles.tiny}>本次携带 {message.contextUsage.includedHistoryMessages} 条历史</Text></View>
+        {message.contextUsage.omittedHistoryMessages > 0 && <Text style={styles.contextWarning}>{message.contextUsage.omittedHistoryMessages} 条较早消息未发送{message.contextUsage.reason === 'message_limit' ? '（按当前条数设置）' : message.contextUsage.reason === 'token_budget' ? '（超出本次上下文容量）' : ''}。原记录仍保存在本机。</Text>}
+        {message.contextUsage.truncated && message.contextUsage.omittedHistoryMessages === 0 && <Text style={styles.contextWarning}>本次上下文达到携带上限，原记录仍保存在本机。</Text>}
+      </View>}
     </View>
     {!isUser && message.status !== 'streaming' && <View style={styles.messageActions}>
       {!!message.content && <Pressable accessibilityRole="button" accessibilityLabel="复制回复" onPress={() => onCopy(message.content)} style={styles.iconButton}><Feather name="copy" size={18} color={colors.green} /></Pressable>}
@@ -181,6 +195,13 @@ const MessageBubble = memo(function MessageBubble({ message, onCopy, onLink, onR
     </View>}
   </View>;
 });
+
+function formatAttachmentSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '大小未知';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 const markdownStyles = StyleSheet.create({ body: { fontSize: 16, color: colors.ink, lineHeight: 27 }, paragraph: { marginTop: 0, marginBottom: 10 }, code_inline: { backgroundColor: '#EDF0EB', color: colors.ink }, fence: { backgroundColor: '#EFF2EC', borderColor: colors.line, color: colors.ink, borderRadius: 8, padding: 12 }, link: { color: colors.green }, heading1: { fontSize: 23, lineHeight: 32 }, heading2: { fontSize: 20, lineHeight: 29 }, table: { borderColor: colors.line }, tr: { borderColor: colors.line } });
 const styles = StyleSheet.create({
@@ -193,6 +214,7 @@ const styles = StyleSheet.create({
   assistantLabel: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }, smallMark: { width: 26, height: 26, borderRadius: 9, backgroundColor: colors.green, justifyContent: 'center', alignItems: 'center' },
   bubble: { maxWidth: '100%', width: '100%' }, userBubble: { backgroundColor: '#EAF0E6', width: 'auto', maxWidth: '88%', borderRadius: 18, borderTopRightRadius: 5, paddingVertical: 12, paddingHorizontal: 17 }, messageText: { fontSize: 16, lineHeight: 27, color: colors.ink },
   reasoning: { backgroundColor: '#F0F2EC', borderRadius: 10, padding: 10, marginBottom: 12 }, reasoningToggle: { flexDirection: 'row', gap: 9, alignItems: 'center' }, reasoningText: { color: '#738076', fontSize: 13, lineHeight: 23, marginTop: 10 },
+  attachments: { gap: 8, marginBottom: 10 }, attachmentCard: { flexDirection: 'row', alignItems: 'center', gap: 10, padding: 12, borderRadius: 10, backgroundColor: '#F8FAF6', borderWidth: 1, borderColor: colors.line, width: 260, maxWidth: '100%' }, attachmentDescription: { flex: 1, minWidth: 0, gap: 2 }, attachmentName: { fontSize: 12, lineHeight: 19, color: colors.ink, fontWeight: '600' }, contextInfo: { marginTop: 10, paddingTop: 8, borderTopWidth: 1, borderTopColor: colors.line, gap: 3 }, contextLabel: { flexDirection: 'row', alignItems: 'center', gap: 5 }, contextWarning: { fontSize: 10, lineHeight: 17, color: '#93754C' },
   typing: { flexDirection: 'row', gap: 10, alignItems: 'center', paddingVertical: 10 }, messageActions: { flexDirection: 'row', alignItems: 'center' }, retry: { flexDirection: 'row', gap: 6, alignItems: 'center', padding: 9 }, iconButton: { padding: 10, minWidth: 40, minHeight: 40, justifyContent: 'center', alignItems: 'center' },
   small: { fontSize: 12, lineHeight: 21, color: colors.muted }, tiny: { fontSize: 10, lineHeight: 17, color: colors.muted }, errorText: { color: '#A45A44', fontSize: 13, lineHeight: 23 },
 });
