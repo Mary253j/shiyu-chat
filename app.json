@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "拾语",
+    "slug": "shiyu-chat",
+    "version": "0.1.1",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "android": {
+      "package": "com.shiyu.chat",
+      "versionCode": 2,
+      "allowBackup": false,
+      "permissions": [
+        "android.permission.INTERNET"
+      ],
+      "blockedPermissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ],
+      "adaptiveIcon": {
+        "backgroundColor": "#315C4C",
+        "foregroundImage": "./assets/android-icon-foreground.png"
+      }
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "output": "single"
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-sharing",
+      "expo-router",
+      "expo-font"
+    ],
+    "scheme": "shiyu",
+    "platforms": [
+      "android",
+      "web"
+    ]
+  }
+}
