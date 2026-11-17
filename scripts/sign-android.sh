@@ -40,15 +40,15 @@ staging_dir="$(mktemp -d "$output_dir/.shiyu-sign.XXXXXXXX")"
 trap 'rm -rf -- "$staging_dir"' EXIT
 
 # apksigner replaces existing APK signatures, including a local debug signature.
-# Both passwords are read by apksigner from the file, never from shell arguments.
+# The keystore and key must use the same password. apksigner reads it once from
+# the file and reuses it for the key; naming the same file twice consumes two lines.
 "$apksigner_bin" sign \
   --ks "$SHIYU_KEYSTORE" \
   --ks-key-alias "${SHIYU_KEY_ALIAS:-shiyu-release}" \
   --ks-pass "file:$SHIYU_KEYSTORE_PASSWORD_FILE" \
-  --key-pass "file:$SHIYU_KEYSTORE_PASSWORD_FILE" \
   --v4-signing-enabled false \
   --out "$staging_dir/signed.apk" \
-  --in "$1"
+  --in "$1" </dev/null
 "$apksigner_bin" verify --verbose --print-certs "$staging_dir/signed.apk"
 
 # A hard link publishes the already verified file atomically without overwriting
