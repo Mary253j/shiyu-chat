@@ -9,6 +9,7 @@ import { ATTACHMENT_LIMITS, classifyAttachment, type MessageAttachment, type Fil
 import { uploadDeepSeekFile, retrieveDeepSeekFile } from '../core/deepseek-files';
 import { createStreamBuffer } from '../core/streamBuffer';
 import { exportHistory, mergeConversations, parseHistory, ImportPreview } from '../core/history';
+import { checkHistoryInputSize, HISTORY_FILE_LIMIT_LABEL } from '../core/history-limits';
 import { deleteAllLocalData, loadApiKey, loadState, saveApiKey, saveState } from './storage';
 
 function useLatestCallback<Args extends unknown[], Result>(callback: (...args: Args) => Result) {
@@ -416,7 +417,7 @@ function useAppController() {
       const result = await DocumentPicker.getDocumentAsync({ type: ['application/json', 'application/zip', 'application/x-zip-compressed', 'application/octet-stream', 'text/plain'], copyToCacheDirectory: true });
       if (result.canceled) return;
       const asset = result.assets[0];
-      if ((asset.size ?? 0) > 20 * 1024 * 1024) throw new Error('文件超过 20 MB，请分批导入。');
+      if (asset.size !== undefined) checkHistoryInputSize(asset.size);
       let bytes: Uint8Array;
       if (Platform.OS === 'web' && asset.file) bytes = new Uint8Array(await asset.file.arrayBuffer());
       else { cached = new File(asset.uri); bytes = await cached.bytes(); }
@@ -436,7 +437,7 @@ function useAppController() {
       exportHistory({ ...current.current, conversations: merged.conversations });
     } catch {
       setPreview(null);
-      setNotice('合并后的记录超过本版 20 MB 备份容量，尚未导入。请先备份并分批整理对话。');
+      setNotice(`合并后的记录未通过备份检查（容量上限 ${HISTORY_FILE_LIMIT_LABEL}），尚未导入。请先备份并分批整理对话。`);
       return;
     }
     update(s => ({ ...s, conversations: merged.conversations, activeConversationId: s.activeConversationId ?? merged.conversations[0]?.id ?? null }));

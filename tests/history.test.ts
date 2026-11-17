@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { strToU8, zipSync, Zip, ZipDeflate } from 'fflate';
 import { exportHistory, HISTORY_LIMITS, mergeConversations, parseHistory } from '../src/core/history';
+import { checkHistoryInputSize } from '../src/core/history-limits';
 import { emptyState, type Conversation } from '../src/core/types';
 
 const date = '2026-11-17T12:00:00.000Z';
@@ -137,7 +138,7 @@ test('rejects truncated, encrypted and oversized ZIP entries before decompressio
   assert.throws(() => parseHistory(encrypted, 'data.zip'), /加密/);
   const large = archive(); const lv = new DataView(large.buffer);
   lv.setUint32(centralOffset(large) + 24, HISTORY_LIMITS.expandedBytes + 1, true);
-  assert.throws(() => parseHistory(large, 'data.zip'), /50 MiB/);
+  assert.throws(() => parseHistory(large, 'data.zip'), /1 GB/);
 });
 
 test('rejects lying compressed-size metadata during bounded inflation', () => {
@@ -235,7 +236,10 @@ test('rejects malformed JSON, unsupported backup schemas and duplicate source co
 });
 
 test('enforces input, total message and nesting limits', () => {
-  assert.throws(() => parseHistory(new Uint8Array(HISTORY_LIMITS.inputBytes + 1), 'large.json'), /20 MiB/);
+  // Check numeric boundaries without allocating or attempting a 1 GB import.
+  assert.equal(HISTORY_LIMITS.inputBytes, 1024 ** 3);
+  assert.doesNotThrow(() => checkHistoryInputSize(HISTORY_LIMITS.inputBytes));
+  assert.throws(() => checkHistoryInputSize(HISTORY_LIMITS.inputBytes + 1), /1 GB/);
   const many = JSON.stringify([{ id: 'many', messages: Array.from({ length: HISTORY_LIMITS.messages + 1 }, () => ({})) }]);
   assert.throws(() => parseHistory(many, 'many.json'), /消息总数/);
   const deep = '['.repeat(70) + '0' + ']'.repeat(70);

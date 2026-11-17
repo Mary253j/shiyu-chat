@@ -1,9 +1,11 @@
+import { HISTORY_FILE_LIMIT_BYTES } from './history-limits';
+
 /** Exact v0.1.1 format constants; changing its AAD would make existing installations unreadable. */
 export const LEGACY_ASSOCIATED_DATA = 'shiyu-chat/local-state/AES-256-GCM/v1';
 export const MAX_PLAINTEXT_BYTES = 64 * 1024 * 1024;
 export const MAX_ENVELOPE_CHARACTERS = MAX_PLAINTEXT_BYTES * 2 + 512;
-/** A single old state may become one conversation/original blob plus a small wrapper. */
-export const MAX_RECORD_BYTES = MAX_PLAINTEXT_BYTES + 1024 * 1024;
+/** A v2 conversation/original blob may fill the history limit, plus its storage wrapper. */
+export const MAX_RECORD_BYTES = HISTORY_FILE_LIMIT_BYTES + 1024 * 1024;
 
 export function parseLegacyEnvelope(serialized: string): { nonce: string; ciphertext: string } {
   if (serialized.length > MAX_ENVELOPE_CHARACTERS) throw new Error('本地记录文件过大，原文件已保留。');

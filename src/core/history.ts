@@ -1,6 +1,7 @@
 import { Inflate, strFromU8, strToU8 } from 'fflate';
 import type { AppState, ContextUsage, Conversation, Message, MessageStatus } from './types';
 import { parseMessageAttachments } from './attachments';
+import { checkHistoryInputSize, HISTORY_FILE_LIMIT_BYTES, HISTORY_FILE_LIMIT_LABEL } from './history-limits';
 
 /**
  * Independent reader of DeepSeek's documented v3 archive format.
@@ -17,8 +18,8 @@ export interface ImportPreview {
 }
 
 export const HISTORY_LIMITS = {
-  inputBytes: 20 * 1024 * 1024,
-  expandedBytes: 50 * 1024 * 1024,
+  inputBytes: HISTORY_FILE_LIMIT_BYTES,
+  expandedBytes: HISTORY_FILE_LIMIT_BYTES,
   entries: 5000,
   conversations: 2000,
   messages: 100000,
@@ -158,7 +159,7 @@ function readZip(input: Uint8Array): Map<string, Uint8Array> {
     if (u16(at + 34) || [entry.compressed, entry.expanded, entry.offset].includes(0xffffffff)) fail('不支持 ZIP64 或分卷 ZIP。');
     if (seen.has(name)) fail(`ZIP 出现重复路径：${name}`);
     seen.add(name); total += entry.expanded;
-    if (total > HISTORY_LIMITS.expandedBytes) fail('解压后的总大小超过 50 MiB。');
+    if (total > HISTORY_LIMITS.expandedBytes) fail(`解压后的总大小超过 ${HISTORY_FILE_LIMIT_LABEL}。`);
     entries.push(entry); at += 46 + nameLength + extra + comment;
   }
   if (at !== end) fail('ZIP 目录长度不匹配。');
@@ -488,9 +489,9 @@ function parseOfficialZip(bytes: Uint8Array, budget: Budget): Conversation[] {
 /** Parses into a preview only: never mutates existing conversations. */
 export function parseHistory(input: string | Uint8Array, filename: string): ImportPreview {
   if (typeof input !== 'string' && !(input instanceof Uint8Array)) fail('文件内容类型不受支持。');
-  if (typeof input === 'string' && input.length > HISTORY_LIMITS.inputBytes) fail('文件超过 20 MiB。');
+  if (typeof input === 'string') checkHistoryInputSize(input.length);
   const bytes = typeof input === 'string' ? strToU8(input) : input;
-  if (bytes.length > HISTORY_LIMITS.inputBytes) fail('文件超过 20 MiB。');
+  checkHistoryInputSize(bytes.length);
   if (!bytes.length) fail('文件为空。');
   const budget: Budget = { messages: 0 }; let conversations: Conversation[]; let sourceLabel: string;
   const zip = bytes[0] === 0x50 && bytes[1] === 0x4b;
