@@ -2,13 +2,17 @@
 
 一个免费、开源的 Android DeepSeek 聊天客户端。把旧对话带过来，继续聊。
 
+**[⬇️ 直接下载安卓安装包 APK（v0.1.1，约 36 MB）](https://github.com/Mary253j/shiyu-chat/releases/download/v0.1.1/shiyu-0.1.1-android-arm64.apk)**
+
+适用于 Android 7.0 及以上的 ARM64 手机。下载后打开 `.apk` 文件安装；当前为测试版。
+
 **软件的全部功能免费。DeepSeek API 费用由用户直接向 DeepSeek 支付。自愿打赏不解锁任何功能。**
 
 本项目由 [Mary253j](https://github.com/Mary253j) 维护，采用 MIT 许可证。当前版本为 **0.1.1 GitHub 预发布版**，仅面向 Android；iOS 暂缓，不代表已通过应用商店审核。
 
 ## 下载与安装
 
-源码仓库：[Mary253j/shiyu-chat](https://github.com/Mary253j/shiyu-chat)。下载安装包请前往 [0.1.1 GitHub Release](https://github.com/Mary253j/shiyu-chat/releases/tag/v0.1.1)，选择 Assets 中的 `.apk` 文件；校验值和验证记录随该版本提供。
+点击上方链接即可下载 `shiyu-0.1.1-android-arm64.apk`。也可以打开 [0.1.1 GitHub Release](https://github.com/Mary253j/shiyu-chat/releases/tag/v0.1.1)，展开 **Assets** 并选择这个 `.apk` 文件；校验值和验证记录随该版本提供。
 
 0.1.1 面向 Android 7.0 及以上 ARM64 手机，自带应用代码，不需要 Metro、开发电脑或作者的服务器。下载后可从系统“文件／下载”打开安装；只在确认来源后允许浏览器或文件管理器安装该 APK。原生鸿蒙设备不保证兼容 Android APK。
 
